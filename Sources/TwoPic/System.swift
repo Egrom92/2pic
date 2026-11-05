@@ -181,19 +181,33 @@ enum Output {
         pb.writeObjects([item])
     }
 
-    @discardableResult
-    static func save(_ img: CGImage, pxPerPt: CGFloat) -> URL? {
-        guard let png = encode(img, type: .png, dpi: 72 * pxPerPt),
-              let desk = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first else { return nil }
+    /// A fresh "2pic <date>.<ext>" path on the Desktop.
+    static func desktopURL(ext: String) -> URL {
+        let desk = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd 'в' HH.mm.ss"
         let base = "2pic \(f.string(from: Date()))"
-        var url = desk.appendingPathComponent(base + ".png")
+        var url = desk.appendingPathComponent("\(base).\(ext)")
         var i = 2
         while FileManager.default.fileExists(atPath: url.path) {
-            url = desk.appendingPathComponent("\(base) (\(i)).png"); i += 1
+            url = desk.appendingPathComponent("\(base) (\(i)).\(ext)"); i += 1
         }
+        return url
+    }
+
+    @discardableResult
+    static func save(_ img: CGImage, pxPerPt: CGFloat) -> URL? {
+        guard let png = encode(img, type: .png, dpi: 72 * pxPerPt) else { return nil }
+        let url = desktopURL(ext: "png")
         do { try png.write(to: url); return url } catch { NSLog("2pic: save failed: %@", "\(error)"); return nil }
+    }
+
+    /// Puts a file on the clipboard (⌘V in a messenger attaches it).
+    static func copyFile(_ url: URL) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.writeObjects([url as NSURL])
     }
 
     final class TIFFProvider: NSObject, NSPasteboardItemDataProvider {

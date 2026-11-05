@@ -1,5 +1,7 @@
 import AppKit
 import Carbon.HIToolbox
+import AVFoundation
+import Stitch
 import ServiceManagement
 
 /// Command-line self-tests, run as a separate instance:
@@ -131,6 +133,52 @@ enum SelfTest {
             try write(ui, a[1])
         case "status":
             log("bundle \(Bundle.main.bundlePath), login item status \(SMAppService.mainApp.status.rawValue) (1 = enabled)")
+        case "record":   // record X Y W H OUTDIR — 3 s video with cursor moves and two bubbles, then frames
+            let rect = CGRect(x: num(0), y: num(1), width: num(2), height: num(3))
+            let out = a[4]
+            let done: URL? = try await withCheckedThrowingContinuation { c in
+                app.startRecording(screen: screen, rect: rect) { c.resume(returning: $0) }
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 600_000_000)
+                    for i in 0...30 {   // sweep the cursor across the region
+                        let t = CGFloat(i) / 30
+                        mouse(.mouseMoved, Screens.quartzPoint(CGPoint(x: rect.minX + rect.width * (0.1 + 0.8 * t),
+                                                                       y: rect.minY + rect.height * (0.3 + 0.4 * t)), on: screen))
+                        try? await Task.sleep(nanoseconds: 33_000_000)
+                    }
+                    let c1 = Screens.cocoaRect(CGRect(x: rect.midX, y: rect.midY, width: 0, height: 0), on: screen).origin
+                    app.debugBubble(at: c1)
+                    try? await Task.sleep(nanoseconds: 700_000_000)
+                    app.debugBubble(at: CGPoint(x: c1.x - 120, y: c1.y + 60))
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    app.stopRecording()
+                }
+            }
+            guard let src = done else { throw Failure(description: "no video") }
+            let dst = URL(fileURLWithPath: out).appendingPathComponent("rec.mp4")
+            try? FileManager.default.removeItem(at: dst)
+            try FileManager.default.moveItem(at: src, to: dst)
+            let asset = AVURLAsset(url: dst)
+            let dur = try await asset.load(.duration)
+            let track = try await asset.loadTracks(withMediaType: .video).first
+            let size = try await track?.load(.naturalSize) ?? .zero
+            let fps = try await track?.load(.nominalFrameRate) ?? 0
+            log(String(format: "video %.0fx%.0f, %.2f s, ~%.0f fps, %d KB", size.width, size.height, dur.seconds, fps,
+                       ((try? FileManager.default.attributesOfItem(atPath: dst.path)[.size] as? Int) ?? 0) / 1024))
+            let gen = AVAssetImageGenerator(asset: asset)
+            gen.requestedTimeToleranceBefore = .zero
+            gen.requestedTimeToleranceAfter = .zero
+            // Contact sheet: 16 frames, 0.1 s apart, around the two bubbles (centre crop of each frame).
+            let cell = CGSize(width: 350, height: 225)
+            let sheet = Stitcher.context(Int(cell.width) * 4, Int(cell.height) * 4, CGColorSpace(name: CGColorSpace.sRGB))!
+            for i in 0..<16 {
+                let t = min(1.4 + Double(i) * 0.1, dur.seconds - 0.05)
+                let img = try await gen.image(at: CMTime(seconds: t, preferredTimescale: 600)).image
+                let crop = img.cropping(to: CGRect(x: img.width / 2 - 350, y: img.height / 2 - 225, width: 700, height: 450))!
+                sheet.draw(crop, in: CGRect(x: CGFloat(i % 4) * cell.width, y: CGFloat(3 - i / 4) * cell.height,
+                                            width: cell.width, height: cell.height))
+            }
+            try write(sheet.makeImage()!, "\(out)/sheet.png")
         case "copy":
             let before = NSPasteboard.general.changeCount
             key(kVK_ANSI_C, [.maskCommand])

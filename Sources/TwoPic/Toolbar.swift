@@ -43,7 +43,7 @@ final class ToolbarView: NSView {
     private var cropButton: ToolButton!
 
     init(onTool: @escaping (Tool?) -> Void, onUndo: @escaping () -> Void, onSave: @escaping () -> Void,
-         onCancel: @escaping () -> Void, onCopy: @escaping () -> Void) {
+         onCancel: @escaping () -> Void, onCopy: @escaping () -> Void, onRecord: (() -> Void)? = nil) {
         super.init(frame: .zero)
         wantsLayer = true
         layer?.backgroundColor = NSColor(white: 0.11, alpha: 0.94).cgColor
@@ -67,6 +67,9 @@ final class ToolbarView: NSView {
         items.append(nil)
         items.append(ToolButton(symbol: "arrow.uturn.backward", tip: "Отменить  ⌘Z", action: onUndo))
         items.append(nil)
+        if let onRecord {
+            items.append(ToolButton(symbol: "record.circle", tip: "Записать видео этой области  V", action: onRecord))
+        }
         items.append(ToolButton(symbol: "square.and.arrow.down", tip: "Сохранить на рабочий стол  ⌘S", action: onSave))
         items.append(ToolButton(symbol: "xmark", tip: "Закрыть  Esc", action: onCancel))
         items.append(ToolButton(symbol: "doc.on.doc", tip: "Скопировать  ⌘C / Enter", action: onCopy))
