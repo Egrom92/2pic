@@ -6,6 +6,7 @@ enum OverlayMode { case capture, scrollSelect, editResult }
 enum Outcome {
     case cancel, copy, save
     case scroll(CGRect)   // chosen region, screen-local top-left points
+    case record(CGRect)   // same, for video
 }
 
 private enum Handle: CaseIterable {
@@ -89,7 +90,8 @@ final class CanvasView: NSView {
                               onUndo: { [weak self] in self?.undo() },
                               onSave: { [weak self] in self?.onFinish?(.save) },
                               onCancel: { [weak self] in self?.onFinish?(.cancel) },
-                              onCopy: { [weak self] in self?.onFinish?(.copy) })
+                              onCopy: { [weak self] in self?.onFinish?(.copy) },
+                              onRecord: mode == .capture ? { [weak self] in self?.startRecord() } : nil)
         for v in [imageView, marksView, chrome, toolbar!, sizeLabel] as [NSView] { addSubview(v) }
         chrome.frame = bounds
         sizeLabel.isHidden = true
@@ -202,6 +204,11 @@ final class CanvasView: NSView {
         toolbar.show(tool: tool)
         if tool == .blur { prepareBlur() }
         refresh()
+    }
+
+    func startRecord() {
+        guard mode == .capture, let sel = selection else { return }
+        onFinish?(.record(toView(sel)))
     }
 
     func undo() {
@@ -389,6 +396,7 @@ final class CanvasView: NSView {
         case kVK_ANSI_Z where cmd:
             undo()
         case kVK_ANSI_C where !cmd && isEditing: setTool(nil)
+        case kVK_ANSI_V where !cmd && isEditing: startRecord()
         case kVK_ANSI_A where !cmd && isEditing: setTool(.arrow)
         case kVK_ANSI_L where !cmd && isEditing: setTool(.line)
         case kVK_ANSI_R where !cmd && isEditing: setTool(.rect)

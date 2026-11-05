@@ -8,6 +8,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var loginItem: NSMenuItem?
     private(set) var overlay: OverlayController?
     private(set) var scroller: ScrollCapturer?
+    private var recorder: RegionRecorder?
+    private var recordHUD: RecordingHUD?
+    private var stopItem: NSMenuItem?
     private var busy = false
     private var previousApp: NSRunningApplication?
 
@@ -35,7 +38,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         scroll.keyEquivalentModifierMask = [.command, .shift]
         let login = NSMenuItem(title: "Запускать при входе в систему", action: #selector(toggleLogin), keyEquivalent: "")
         loginItem = login
-        for i in [area, scroll, .separator(), login, .separator(),
+        let stop = NSMenuItem(title: "Остановить запись видео", action: #selector(menuStopRecording), keyEquivalent: "")
+        stop.isHidden = true
+        stopItem = stop
+        for i in [stop, area, scroll, .separator(), login, .separator(),
                   NSMenuItem(title: "Выйти из 2pic", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")] {
             if i.action != #selector(NSApplication.terminate(_:)) { i.target = self }
             menu.addItem(i)
@@ -46,6 +52,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) {
         loginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        stopItem?.isHidden = recorder == nil
     }
 
     @objc private func menuArea() { DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { self.captureArea() } }
@@ -73,13 +80,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: capture flows
 
+    @objc private func menuStopRecording() { stopRecording() }
+
     func captureArea() {
+        if recorder != nil { stopRecording(); return }   // ⌘⇧9 while recording stops it
         if scroller != nil { return }
         startOverlay(mode: .capture)
     }
 
     func captureScrolling() {
         if let s = scroller { s.stop(); return }   // second ⌘⇧8 stops scrolling
+        if recorder != nil { stopRecording(); return }
         guard ensureAccessibility() else { return }
         startOverlay(mode: .scrollSelect)
     }
@@ -123,6 +134,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async { if let img = canvas.render() { Output.save(img, pxPerPt: pxPerPt) } }
         case .scroll(let rect):
             startScroll(screen: ov.screen, rect: rect)
+        case .record(let rect):
+            startRecording(screen: ov.screen, rect: rect)
         }
     }
 
@@ -138,6 +151,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.previousApp = NSWorkspace.shared.frontmostApplication
             self.present(OverlayController(screen: screen, base: img, mode: .editResult, windows: [],
                                            pxPerPt: screen.backingScaleFactor))
+        }
+    }
+
+    // MARK: video
+
+    func startRecording(screen: NSScreen, rect: CGRect, completion: ((URL?) -> Void)? = nil) {
+        guard recorder == nil, recordHUD == nil else { return }
+        let hud = RecordingHUD(screen: screen, rect: rect) { [weak self] in self?.stopRecording() }
+        recordHUD = hud
+        hud.show()
+        recordingDone = completion
+        Task { @MainActor in
+            do {
+                self.recorder = try await RegionRecorder(screen: screen, rect: rect, url: Output.desktopURL(ext: "mp4"),
+                                                         exclude: hud.excludedWindows)
+                self.setStatusIcon(recording: true)
+                DiagLog.write("record: started \(rect)")
+            } catch {
+                hud.close()
+                self.recordHUD = nil
+                self.alert("Не удалось начать запись", error.localizedDescription)
+                completion?(nil)
+            }
+        }
+    }
+
+    private var recordingDone: ((URL?) -> Void)?
+
+    /// Self-test: show a click bubble without actually clicking.
+    func debugBubble(at cocoaPoint: CGPoint) { recordHUD?.bubble(at: cocoaPoint) }
+
+    func stopRecording() {
+        guard let rec = recorder else { return }
+        recorder = nil
+        recordHUD?.close()
+        recordHUD = nil
+        setStatusIcon(recording: false)
+        Task { @MainActor in
+            let url = await rec.stop()
+            DiagLog.write("record: stopped, \(rec.frames) frames → \(url?.path ?? "nil")")
+            if let done = self.recordingDone { self.recordingDone = nil; done(url); return }
+            guard let url else { return }
+            Output.copyFile(url)
+            Toast.show("Видео сохранено на рабочий стол и скопировано")
+        }
+    }
+
+    private func setStatusIcon(recording: Bool) {
+        let img = NSImage(systemSymbolName: recording ? "record.circle.fill" : "camera.viewfinder", accessibilityDescription: "2pic")
+        img?.isTemplate = !recording
+        if recording {
+            statusItem?.button?.image = img?.withSymbolConfiguration(.init(paletteColors: [.systemRed]))
+        } else {
+            statusItem?.button?.image = img
         }
     }
 
