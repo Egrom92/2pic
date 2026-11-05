@@ -40,7 +40,9 @@ final class ToolButton: NSView {
 final class ToolbarView: NSView {
     private var toolButtons: [(Tool, ToolButton)] = []
 
-    init(onTool: @escaping (Tool) -> Void, onUndo: @escaping () -> Void, onSave: @escaping () -> Void,
+    private var cropButton: ToolButton!
+
+    init(onTool: @escaping (Tool?) -> Void, onUndo: @escaping () -> Void, onSave: @escaping () -> Void,
          onCancel: @escaping () -> Void, onCopy: @escaping () -> Void) {
         super.init(frame: .zero)
         wantsLayer = true
@@ -55,7 +57,8 @@ final class ToolbarView: NSView {
             (.rect, "rectangle", "Рамка  R"),
             (.blur, "drop.halffull", "Размытие  B"),
         ]
-        var items: [NSView?] = []
+        cropButton = ToolButton(symbol: "crop", tip: "Обрезка: тяните за края  C") { onTool(nil) }
+        var items: [NSView?] = [cropButton, nil]
         for (t, sym, tip) in tools {
             let b = ToolButton(symbol: sym, tip: tip) { onTool(t) }
             toolButtons.append((t, b))
@@ -92,6 +95,7 @@ final class ToolbarView: NSView {
 
     func show(tool: Tool?) {
         for (t, b) in toolButtons { b.isOn = (t == tool) }
+        cropButton.isOn = (tool == nil)
     }
 }
 
