@@ -15,6 +15,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var previousApp: NSRunningApplication?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if CommandLine.arguments.contains("--unregister-login") {   // used by uninstall.sh
+            try? SMAppService.mainApp.unregister()
+            NSApp.terminate(nil)
+            return
+        }
         if SelfTest.start(self) { return }
         setupMenu()
         HotKeys.shared.register(keyCode: kVK_ANSI_9, modifiers: cmdKey | shiftKey) { [weak self] in self?.captureArea() }
@@ -67,7 +72,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func enableLoginItemOnce() {
-        guard Bundle.main.bundlePath.hasPrefix("/Applications/") else { return }
+        let path = Bundle.main.bundlePath
+        guard path.hasPrefix("/Applications/") || path.hasPrefix(NSHomeDirectory() + "/Applications/") else { return }
         let key = "loginItemConfigured"
         guard !UserDefaults.standard.bool(forKey: key) else { return }
         do {
