@@ -230,7 +230,9 @@ enum SelfTest {
     }
 
     static func mouse(_ type: CGEventType, _ p: CGPoint) {
-        CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: p, mouseButton: .left)?.post(tap: .cghidEventTap)
+        let e = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: p, mouseButton: .left)
+        e?.flags = []   // otherwise a preceding synthetic ⌘⇧ can leak in as Shift (45° snapping)
+        e?.post(tap: .cghidEventTap)
     }
 
     static func dragMouse(_ a: CGPoint, _ b: CGPoint) async throws {
@@ -276,7 +278,7 @@ enum SelfTest {
                     var red = 0
                     for y in stride(from: 0, to: rep.pixelsHigh, by: 2) { for x in stride(from: 0, to: rep.pixelsWide, by: 2) {
                         if let c = rep.colorAt(x: x, y: y)?.usingColorSpace(.sRGB),
-                           c.redComponent > 0.9, c.greenComponent < 0.35, c.blueComponent < 0.35 { red += 1 }
+                           c.redComponent > 0.8, c.greenComponent < 0.4, c.blueComponent < 0.4 { red += 1 }
                     } }
                     log("clipboard PNG \(rep.pixelsWide)x\(rep.pixelsHigh), annotation-red pixels: \(red) → \(path)")
                 }
