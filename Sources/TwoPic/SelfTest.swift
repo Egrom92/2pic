@@ -62,7 +62,7 @@ enum SelfTest {
                                        windows: WindowList.rects(on: screen, pxPerPt: s), pxPerPt: s)
             app.present(ov)
             let sel = CGRect(x: shot.width / 5, y: shot.height / 6, width: shot.width * 3 / 5, height: shot.height / 2)
-            ov.canvas.debugSet(selection: sel, annotations: sampleMarks(sel, s), tool: .arrow)
+            ov.canvas.debugSet(selection: sel, annotations: sampleMarks(sel, s), tool: nil)
             try await Task.sleep(nanoseconds: 700_000_000)
             let ui = try await Capture.screen(screen, cursor: true)
             for (x, y) in [(100, 100), (3500, 2200), (1800, 1000), (3400, 600)] {
@@ -92,7 +92,10 @@ enum SelfTest {
             try await waitOverlayTimed()
             try await dragMouse(p1, p2)
             if kind == "e2e-area" {
-                try await Task.sleep(nanoseconds: 400_000_000)
+                try await Task.sleep(nanoseconds: 300_000_000)
+                // Drag inside the selection without choosing a tool: the default tool should draw an arrow.
+                try await dragMouse(CGPoint(x: p1.x + 40, y: p2.y - 40), CGPoint(x: p2.x - 60, y: p1.y + 50))
+                try await Task.sleep(nanoseconds: 300_000_000)
             } else {
                 log("waiting for scrolling to finish…")
                 let t0 = Date()
@@ -221,7 +224,14 @@ enum SelfTest {
         for _ in 0..<40 {
             if NSPasteboard.general.changeCount != count, let d = NSPasteboard.general.data(forType: .png) {
                 try d.write(to: URL(fileURLWithPath: path))
-                if let rep = NSBitmapImageRep(data: d) { log("clipboard PNG \(rep.pixelsWide)x\(rep.pixelsHigh) → \(path)") }
+                if let rep = NSBitmapImageRep(data: d) {
+                    var red = 0
+                    for y in stride(from: 0, to: rep.pixelsHigh, by: 2) { for x in stride(from: 0, to: rep.pixelsWide, by: 2) {
+                        if let c = rep.colorAt(x: x, y: y)?.usingColorSpace(.sRGB),
+                           c.redComponent > 0.9, c.greenComponent < 0.35, c.blueComponent < 0.35 { red += 1 }
+                    } }
+                    log("clipboard PNG \(rep.pixelsWide)x\(rep.pixelsHigh), annotation-red pixels: \(red) → \(path)")
+                }
                 return
             }
             try await Task.sleep(nanoseconds: 100_000_000)

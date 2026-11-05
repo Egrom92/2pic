@@ -85,7 +85,7 @@ final class CanvasView: NSView {
             selection = imageBounds
         }
         marksView.canvas = self
-        toolbar = ToolbarView(onTool: { [weak self] t in self?.toggle(t) },
+        toolbar = ToolbarView(onTool: { [weak self] t in self?.setTool(t) },
                               onUndo: { [weak self] in self?.undo() },
                               onSave: { [weak self] in self?.onFinish?(.save) },
                               onCancel: { [weak self] in self?.onFinish?(.cancel) },
@@ -102,6 +102,7 @@ final class CanvasView: NSView {
         }
         addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseMoved, .activeAlways, .inVisibleRect, .cursorUpdate],
                                        owner: self))
+        setTool(mode == .editResult ? .arrow : nil)
         refresh()
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -158,7 +159,7 @@ final class CanvasView: NSView {
         chrome.update(hole: sv ?? hv,
                       selection: sv,
                       hover: hv,
-                      handles: (sv != nil && isEditing) ? Handle.allCases.map { $0.point(sv!) } : [])
+                      handles: (sv != nil && isEditing && tool == nil) ? Handle.allCases.map { $0.point(sv!) } : [])
         if let sv {
             let vis = sv.intersection(bounds)
             marksView.isHidden = vis.isNull
@@ -195,10 +196,12 @@ final class CanvasView: NSView {
 
     // MARK: actions
 
-    func toggle(_ t: Tool) {
-        tool = (tool == t) ? nil : t
+    /// nil = crop mode: handles resize the selection, dragging inside moves it.
+    func setTool(_ t: Tool?) {
+        tool = t
         toolbar.show(tool: tool)
         if tool == .blur { prepareBlur() }
+        refresh()
     }
 
     func undo() {
@@ -220,21 +223,24 @@ final class CanvasView: NSView {
     func debugSet(selection: CGRect, annotations: [Annotation], tool: Tool?) {
         self.selection = selection
         self.annotations = annotations
-        if let tool { toggle(tool) }
+        setTool(tool)
         if annotations.contains(where: { $0.tool == .blur }) { prepareBlur() }
         refresh()
     }
 
     // MARK: mouse
 
+    private var hadSelection = false
+
     override func mouseDown(with e: NSEvent) {
         let p = location(e)
+        hadSelection = selection != nil
         downPoint = p
         dragging = false
         guard isEditing, let sel = selection else { drag = .select(p); return }
         let sv = toView(sel)
-        if e.clickCount == 2, tool == nil, sv.contains(p) { onFinish?(.copy); return }
-        if let h = handle(at: p, in: sv) { drag = .resize(h, sel); return }
+        if e.clickCount == 2, sv.contains(p) { current = nil; onFinish?(.copy); return }
+        if tool == nil, let h = handle(at: p, in: sv) { drag = .resize(h, sel); return }
         if sv.contains(p) {
             if let t = tool {
                 if t == .blur { prepareBlur() }
@@ -247,7 +253,8 @@ final class CanvasView: NSView {
             }
             return
         }
-        drag = (mode == .editResult && !imageRect.contains(p)) ? .none : .select(p)
+        // Outside the selection: in crop mode start a new selection, with a drawing tool do nothing.
+        drag = (tool != nil || (mode == .editResult && !imageRect.contains(p))) ? .none : .select(p)
     }
 
     override func mouseDragged(with e: NSEvent) {
@@ -295,10 +302,12 @@ final class CanvasView: NSView {
         defer { drag = .none; dragging = false; refresh(); updateCursor(location(e)) }
         switch drag {
         case .select:
+            let firstSelection = !hadSelection
             if !dragging {
                 guard selection == nil else { return }   // stray click outside: keep the selection
                 selection = hover ?? imageBounds          // click: the window under the cursor, or the whole screen
             }
+            defer { if firstSelection && mode == .capture && selection != nil { setTool(.arrow) } }
             guard let sel = selection, sel.width >= 6, sel.height >= 6 else {
                 if mode != .editResult { selection = nil }
                 return
@@ -335,7 +344,7 @@ final class CanvasView: NSView {
         if !toolbar.isHidden && toolbar.frame.contains(p) { NSCursor.arrow.set(); return }
         guard isEditing, let sel = selection else { NSCursor.crosshair.set(); return }
         let sv = toView(sel)
-        if let h = handle(at: p, in: sv) {
+        if tool == nil, let h = handle(at: p, in: sv) {
             switch h {
             case .t, .b: NSCursor.resizeUpDown.set()
             case .l, .r: NSCursor.resizeLeftRight.set()
@@ -379,10 +388,11 @@ final class CanvasView: NSView {
             if mode != .scrollSelect { onFinish?(.save) }
         case kVK_ANSI_Z where cmd:
             undo()
-        case kVK_ANSI_A where !cmd && isEditing: toggle(.arrow)
-        case kVK_ANSI_L where !cmd && isEditing: toggle(.line)
-        case kVK_ANSI_R where !cmd && isEditing: toggle(.rect)
-        case kVK_ANSI_B where !cmd && isEditing: toggle(.blur)
+        case kVK_ANSI_C where !cmd && isEditing: setTool(nil)
+        case kVK_ANSI_A where !cmd && isEditing: setTool(.arrow)
+        case kVK_ANSI_L where !cmd && isEditing: setTool(.line)
+        case kVK_ANSI_R where !cmd && isEditing: setTool(.rect)
+        case kVK_ANSI_B where !cmd && isEditing: setTool(.blur)
         default:
             return false
         }
