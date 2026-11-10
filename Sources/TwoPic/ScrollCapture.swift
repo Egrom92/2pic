@@ -11,6 +11,7 @@ final class ScrollCapturer {
     private var hud: ScrollHUD?
     private var escKey: UInt32?
     private var clickMonitor: Any?
+    private var keyMonitor: Any?
     var log: ((String) -> Void)?
     /// Self-test only: save every grabbed frame here.
     static var debugFrameDir: String?
@@ -32,6 +33,10 @@ final class ScrollCapturer {
         hud?.show()
         escKey = HotKeys.shared.register(keyCode: kVK_Escape, modifiers: 0) { [weak self] in self?.stop() }
         clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            self?.stop()
+        }
+        // Any key stops scrolling (needs Accessibility / Input Monitoring; Esc above works without it).
+        keyMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { [weak self] _ in
             self?.stop()
         }
         defer { cleanup() }
@@ -79,6 +84,8 @@ final class ScrollCapturer {
         escKey = nil
         if let m = clickMonitor { NSEvent.removeMonitor(m) }
         clickMonitor = nil
+        if let m = keyMonitor { NSEvent.removeMonitor(m) }
+        keyMonitor = nil
         hud?.close()
         hud = nil
     }
@@ -156,7 +163,7 @@ final class ScrollHUD {
         }
         required init?(coder: NSCoder) { fatalError() }
         func setHeight(_ h: CGFloat) {
-            label.stringValue = h > 0 ? "Прокрутка… \(Int(h)) pt   ■ Стоп (Esc)" : "Прокрутка…   ■ Стоп (Esc)"
+            label.stringValue = h > 0 ? "Прокрутка… \(Int(h)) pt   ■ Стоп (любая клавиша)" : "Прокрутка…   ■ Стоп (любая клавиша)"
             label.sizeToFit()
             let s = label.frame.size
             if frame.width < s.width + 24 { setFrameSize(NSSize(width: s.width + 24, height: s.height + 12)) }
