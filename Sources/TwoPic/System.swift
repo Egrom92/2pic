@@ -21,7 +21,7 @@ final class HotKeys {
                                          EventHotKeyID(signature: 0x32504943 /* 2PIC */, id: id),
                                          GetApplicationEventTarget(), 0, &ref)
         guard status == noErr, let ref else {
-            NSLog("2pic: hotkey %d registration failed (%d)", keyCode, status)
+            Log.error("hotkey", "registering key \(keyCode) failed (\(status)): probably taken by another app")
             return nil
         }
         refs[id] = ref
@@ -155,13 +155,30 @@ enum WindowList {
     }
 }
 
+extension WindowList {
+    /// The app owning the topmost normal window at a global (Quartz) point: its bundle id, for the log.
+    static func app(at p: CGPoint) -> String? {
+        guard let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+                as? [[String: Any]] else { return nil }
+        let me = ProcessInfo.processInfo.processIdentifier
+        for w in info {
+            guard (w[kCGWindowLayer as String] as? Int) == 0, let pid = w[kCGWindowOwnerPID as String] as? Int32, pid != me,
+                  let bd = w[kCGWindowBounds as String] as? NSDictionary, let r = CGRect(dictionaryRepresentation: bd),
+                  r.contains(p) else { continue }
+            return NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? (w[kCGWindowOwnerName as String] as? String)
+        }
+        return nil
+    }
+}
+
 // MARK: - Output: clipboard and file
 
 enum Output {
-    static func encode(_ img: CGImage, type: UTType, dpi: CGFloat) -> Data? {
+    static func encode(_ img: CGImage, type: UTType, dpi: CGFloat, quality: Double? = nil) -> Data? {
         let data = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(data, type.identifier as CFString, 1, nil) else { return nil }
-        let props: [CFString: Any] = [kCGImagePropertyDPIWidth: dpi, kCGImagePropertyDPIHeight: dpi]
+        var props: [CFString: Any] = [kCGImagePropertyDPIWidth: dpi, kCGImagePropertyDPIHeight: dpi]
+        if let quality { props[kCGImageDestinationLossyCompressionQuality] = quality }
         CGImageDestinationAddImage(dest, img, props as CFDictionary)
         return CGImageDestinationFinalize(dest) ? data as Data : nil
     }
@@ -181,33 +198,42 @@ enum Output {
         pb.writeObjects([item])
     }
 
-    /// A fresh "2pic <date>.<ext>" path on the Desktop.
-    static func desktopURL(ext: String) -> URL {
-        let desk = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser
+    /// A fresh "2pic <date>.<ext>" path in the save folder (Settings; the Desktop by default).
+    static func newFileURL(ext: String) -> URL {
+        let dir = Settings.saveFolder
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd 'в' HH.mm.ss"
         let base = "2pic \(f.string(from: Date()))"
-        var url = desk.appendingPathComponent("\(base).\(ext)")
+        var url = dir.appendingPathComponent("\(base).\(ext)")
         var i = 2
         while FileManager.default.fileExists(atPath: url.path) {
-            url = desk.appendingPathComponent("\(base) (\(i)).\(ext)"); i += 1
+            url = dir.appendingPathComponent("\(base) (\(i)).\(ext)"); i += 1
         }
         return url
     }
 
     enum SaveError: LocalizedError {
         case encode
-        var errorDescription: String? { "Не удалось закодировать снимок в PNG." }
+        var errorDescription: String? { "Не удалось закодировать снимок." }
     }
 
-    /// Writes a PNG to the Desktop and returns where it went.
+    /// Writes the picture (PNG or JPEG, see Settings) to the save folder and returns where it went.
     @discardableResult
     static func save(_ img: CGImage, pxPerPt: CGFloat) throws -> URL {
-        guard let png = encode(img, type: .png, dpi: 72 * pxPerPt) else { throw SaveError.encode }
-        let url = desktopURL(ext: "png")
-        try png.write(to: url)
+        let fmt = Settings.imageFormat
+        guard let data = encode(img, type: fmt.type, dpi: 72 * pxPerPt, quality: fmt == .jpeg ? 0.9 : nil) else {
+            throw SaveError.encode
+        }
+        let url = newFileURL(ext: fmt.ext)
+        try data.write(to: url)
         return url
+    }
+
+    /// Puts plain text on the clipboard.
+    static func copyText(_ s: String) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(s, forType: .string)
     }
 
     /// Puts a file on the clipboard (⌘V in a messenger attaches it).
@@ -243,20 +269,6 @@ enum Input {
                 ev.post(tap: .cghidEventTap)
             }
             remaining -= d
-        }
-    }
-}
-
-// MARK: - Small diagnostic log (~/Library/Logs/2pic.log), used for scrolling capture
-
-enum DiagLog {
-    static let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/2pic.log")
-    static func write(_ s: String) {
-        let line = "\(ISO8601DateFormatter().string(from: Date())) \(s)\n"
-        if let h = try? FileHandle(forWritingTo: url) {
-            h.seekToEndOfFile(); h.write(line.data(using: .utf8)!); try? h.close()
-        } else {
-            try? line.data(using: .utf8)!.write(to: url)
         }
     }
 }
