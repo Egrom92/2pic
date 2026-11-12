@@ -42,10 +42,16 @@ func makePage(width: Int, height: Int, seed: UInt64) -> CGImage {
 var sidebar = 0   // width of a static panel on the left (another window / fixed sidebar)
 
 func makeFrame(page: CGImage, offset: Int, viewH: Int, header: Int, footer: Int) -> CGImage {
-    let w = page.width, body = viewH - header - footer
-    let ctx = Stitcher.context(w, viewH, page.colorSpace)!
+    let body = viewH - header - footer
+    let slice = page.cropping(to: CGRect(x: 0, y: offset, width: page.width, height: body))!
+    return makeFrame(slice: slice, pageH: page.height, offset: offset, viewH: viewH, header: header, footer: footer)
+}
+
+/// Same, from an already cut (and possibly altered) slice of the page.
+func makeFrame(slice: CGImage, pageH: Int, offset: Int, viewH: Int, header: Int, footer: Int) -> CGImage {
+    let w = slice.width, body = viewH - header - footer
+    let ctx = Stitcher.context(w, viewH, slice.colorSpace)!
     // page slice (CG origin is bottom-left)
-    let slice = page.cropping(to: CGRect(x: 0, y: offset, width: w, height: body))!
     ctx.draw(slice, in: CGRect(x: 0, y: footer, width: w, height: body))
     if header > 0 {
         ctx.setFillColor(CGColor(red: 0.2, green: 0.3, blue: 0.6, alpha: 1))
@@ -66,7 +72,7 @@ func makeFrame(page: CGImage, offset: Int, viewH: Int, header: Int, footer: Int)
     }
     // overlay scrollbar thumb, position depends on offset
     let track = body - 80
-    let range = max(1, page.height - body)
+    let range = max(1, pageH - body)
     let thumbY = footer + body - 80 - Int(Double(track) * Double(offset) / Double(range))
     ctx.setFillColor(CGColor(gray: 0.45, alpha: 1))
     ctx.fill(CGRect(x: w - 14, y: thumbY, width: 8, height: 80))
@@ -82,6 +88,101 @@ func pixels(_ img: CGImage) -> [UInt8] {
         ctx.draw(img, in: CGRect(x: 0, y: 0, width: img.width, height: img.height))
     }
     return buf
+}
+
+func image(_ px: [UInt8], _ w: Int, _ h: Int) -> CGImage {
+    var p = px
+    return p.withUnsafeMutableBytes { b in
+        CGContext(data: b.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                  space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!.makeImage()!
+    }
+}
+
+/// A page whose content changes while it is being captured, like real sites and apps do:
+/// - `lazy`: whatever first shows up in the bottom 30 % of the viewport is a light-grey skeleton
+///   (lazy images, virtualized lists) and is "loaded" once it has moved higher;
+/// - `video`: these page rows show different noise in every frame (a video, a carousel, an animation).
+/// The capture must not stop, must find the right shifts, and must end with the loaded content.
+/// `actual`: how far the app really scrolls on each step, if not `step` (smooth scrolling cut short, acceleration).
+/// `mayStop`: stopping is acceptable here; gluing at a wrong offset never is.
+func runDynamic(name: String, pageH: Int, viewH: Int, header: Int, footer: Int, step: Int, seed: UInt64,
+                lazy: Bool, video: Range<Int>?, actual: [Int]? = nil, mayStop: Bool = false) -> Bool {
+    let width = 1200, row = width * 4
+    let page = makePage(width: width, height: pageH, seed: seed)
+    let pagePx = pixels(page)
+    var skelPx = pagePx
+    if lazy {
+        for i in stride(from: 0, to: skelPx.count, by: 4) {
+            let l = (Int(skelPx[i]) + Int(skelPx[i + 1]) + Int(skelPx[i + 2])) / 3
+            let v: UInt8 = l < 250 ? 226 : 255
+            skelPx[i] = v; skelPx[i + 1] = v; skelPx[i + 2] = v
+        }
+    }
+    let body = viewH - header - footer
+    var loadedUpTo = 0, frameNo = 0
+    func frame(_ offset: Int) -> CGImage {
+        frameNo += 1
+        var px = Array(pagePx[(offset * row)..<((offset + body) * row)])
+        if lazy {
+            let edge = offset + body * 7 / 10
+            let from = max(loadedUpTo, edge), to = offset + body
+            if from < to {
+                px.replaceSubrange(((from - offset) * row)..<((to - offset) * row), with: skelPx[(from * row)..<(to * row)])
+            }
+            loadedUpTo = max(loadedUpTo, edge)
+        }
+        if let v = video, max(v.lowerBound, offset) < min(v.upperBound, offset + body) {
+            var r = LCG(s: UInt64(frameNo) &* 7919 &+ 17)
+            for y in max(v.lowerBound, offset)..<min(v.upperBound, offset + body) {
+                let o = (y - offset) * row
+                for x in stride(from: 40, to: width - 60, by: 4) {
+                    let g = UInt8(r.next() % 256)
+                    for d in 0..<4 { px[o + (x + d) * 4] = g; px[o + (x + d) * 4 + 1] = g; px[o + (x + d) * 4 + 2] = g }
+                }
+            }
+        }
+        return makeFrame(slice: image(px, width, body), pageH: pageH, offset: offset, viewH: viewH, header: header, footer: footer)
+    }
+
+    let st = Stitcher(maxHeight: 100_000)
+    var offset = 0, last = 0, frames = 1
+    _ = st.add(frame(0), requestedShift: 0)
+    while frames < 100 {
+        offset = min(offset + (actual.map { $0[(frames - 1) % $0.count] } ?? step), pageH - body)
+        let r = st.add(frame(offset), requestedShift: step)
+        frames += 1
+        if r == .noChange { break }
+        if r == .failed && mayStop {
+            print("  \(name): OK — stopped safely at offset \(offset) of \(pageH - body), no wrong seam before it")
+            return true
+        }
+        if r == .failed {
+            print("  \(name): FAILED at offset \(offset) of \(pageH - body) — \(st.lastProbe.map { "\($0)" } ?? "")")
+            return false
+        }
+        if case .appended(let s) = r, s != offset - last {
+            print("  \(name): wrong shift \(s), expected \(offset - last)"); return false
+        }
+        last = offset
+    }
+    guard let out = st.compose() else { print("  \(name): compose failed"); return false }
+    let expected = makeFrame(page: page, offset: 0, viewH: header + pageH + footer, header: header, footer: footer)
+    guard out.width == expected.width, out.height == expected.height else {
+        print("  \(name): size \(out.width)x\(out.height), expected \(expected.width)x\(expected.height)"); return false
+    }
+    // The last viewport may keep its skeleton (nothing came after it); video rows differ by design.
+    let checkH = lazy ? header + pageH - body : out.height
+    let skip = video.map { (header + $0.lowerBound)..<(header + $0.upperBound) } ?? 0..<0
+    let a = pixels(out), b = pixels(expected)
+    var bad = 0
+    for y in 0..<checkH where !skip.contains(y) {
+        for x in 0..<(out.width - 20) {
+            let o = (y * out.width + x) * 4
+            if a[o] != b[o] || a[o + 1] != b[o + 1] || a[o + 2] != b[o + 2] { bad += 1 }
+        }
+    }
+    print("  \(name): \(bad == 0 ? "OK" : "MISMATCH \(bad) px") — \(frames) frames")
+    return bad == 0
 }
 
 func run(name: String, pageH: Int, viewH: Int, header: Int, footer: Int, steps: [Int], seed: UInt64) -> Bool {
@@ -152,5 +253,14 @@ allOK = run(name: "browser-like", pageH: 9000, viewH: 1400, header: 120, footer:
 allOK = run(name: "no header", pageH: 5000, viewH: 1000, header: 0, footer: 0, steps: [500, 430, 610], seed: 2) && allOK
 allOK = run(name: "big steps", pageH: 7000, viewH: 1600, header: 80, footer: 0, steps: [1200], seed: 3) && allOK
 allOK = run(name: "retina tall", pageH: 14000, viewH: 2200, header: 140, footer: 90, steps: [1000], seed: 4) && allOK
+// Content that changes during the capture (what made real captures stop early).
+allOK = runDynamic(name: "lazy loading", pageH: 9000, viewH: 1400, header: 120, footer: 60, step: 610, seed: 5,
+                   lazy: true, video: nil) && allOK
+allOK = runDynamic(name: "video mid-page", pageH: 7000, viewH: 1400, header: 120, footer: 60, step: 610, seed: 6,
+                   lazy: false, video: 3000..<3280) && allOK
+allOK = runDynamic(name: "video at the end", pageH: 5000, viewH: 1400, header: 120, footer: 60, step: 610, seed: 7,
+                   lazy: false, video: 4500..<4780) && allOK
+allOK = runDynamic(name: "video + uneven scrolling", pageH: 7000, viewH: 1400, header: 120, footer: 60, step: 610,
+                   seed: 8, lazy: false, video: 2600..<2880, actual: [610, 520, 640, 610, 470], mayStop: true) && allOK
 print(allOK ? "ALL OK" : "SOME FAILED")
 exit(allOK ? 0 : 1)

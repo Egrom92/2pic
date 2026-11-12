@@ -123,7 +123,7 @@ final class RegionRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
 
     /// On `queue`: logs the problem and tells the app once, so it can stop and explain what happened.
     private func interrupt(_ e: Error) {
-        DiagLog.write("record: interrupted: \(e)")
+        Log.warn("record", "interrupted: \(e)")
         guard !interrupted else { return }
         interrupted = true
         onInterrupt(e)

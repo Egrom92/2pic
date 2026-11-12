@@ -17,6 +17,10 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp .build/release/TwoPic "$APP/Contents/MacOS/2pic"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
+# Which code this is, for the log: the git commit (+ "modified" if there were uncommitted changes) and the build time.
+COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "source archive")
+if git rev-parse --git-dir >/dev/null 2>&1 && ! git diff --quiet HEAD -- Sources Resources 2>/dev/null; then COMMIT="$COMMIT modified"; fi
+/usr/libexec/PlistBuddy -c "Add :TwoPicBuild string $COMMIT, built $(date '+%Y-%m-%d %H:%M')" "$APP/Contents/Info.plist"
 
 if [ ! -f build/AppIcon.icns ]; then
     swift scripts/make-icon.swift build/AppIcon.iconset

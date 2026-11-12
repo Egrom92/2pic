@@ -14,9 +14,27 @@ final class ScrollCapturer {
     private var stopTapSource: CFRunLoopSource?
     private var clickMonitor: Any?
     private var keyMonitor: Any?
-    var log: ((String) -> Void)?
+    /// Why the capture ended early, for the result editor to tell the user (nil: it reached the end or was stopped).
+    private(set) var notice: String?
+    /// How it ended, for the usage statistics: end, userStopped, stoppedEarly, full, noCapture.
+    private(set) var outcome = "noCapture"
+    private(set) var frames = 0
     /// Self-test only: save every grabbed frame here.
     static var debugFrameDir: String?
+    /// Diagnostics, off by default: `defaults write local.2pic saveScrollFramesOnFailure -bool YES` keeps the two
+    /// frames that could not be glued in ~/Library/Logs/2pic-scroll-failures (they are screenshots: local only).
+    private func saveFailedPair(_ a: CGImage?, _ b: CGImage) {
+        guard UserDefaults.standard.bool(forKey: "saveScrollFramesOnFailure"), let a else { return }
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH.mm.ss"
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/2pic-scroll-failures/\(f.string(from: Date()))")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        for (img, name) in [(a, "1-before.png"), (b, "2-after.png")] {
+            try? Output.encode(img, type: .png, dpi: 144)?.write(to: dir.appendingPathComponent(name))
+        }
+        Log.info("scroll", "frames saved to \(dir.lastPathComponent)")
+    }
     private func dump(_ img: CGImage, _ n: Int) {
         guard let dir = Self.debugFrameDir, let d = Output.encode(img, type: .png, dpi: 144) else { return }
         try? d.write(to: URL(fileURLWithPath: "\(dir)/frame\(n).png"))
@@ -27,7 +45,16 @@ final class ScrollCapturer {
         self.rect = rect.integral
     }
 
-    func stop() { stopRequested = true }
+    func stop() {
+        if !stopRequested { Log.info("scroll", "stop requested by the user") }
+        stopRequested = true
+    }
+
+    private func grabFailed() {
+        outcome = "stoppedEarly"
+        Log.error("scroll", "capturing frame \(frames + 1) failed")
+        notice = "Прокрутка остановилась: не удалось снять следующий кадр. Снято до этого места."
+    }
 
     func run() async -> CGImage? {
         let scale = screen.backingScaleFactor
@@ -38,7 +65,7 @@ final class ScrollCapturer {
         // captured (the cursor sits in the middle of its page: a click there could follow a link, a key could
         // submit a form). If the tap can't be created, fall back to monitors, which only watch.
         if !installStopTap() {
-            log?("event tap unavailable, using monitors")
+            Log.warn("scroll", "event tap unavailable, using monitors: the stopping click will reach the app")
             clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
                 self?.stop()
             }
@@ -53,12 +80,14 @@ final class ScrollCapturer {
         try? await Task.sleep(nanoseconds: 120_000_000)
 
         guard let grabber = try? await RegionGrabber(screen: screen, rect: rect),
-              let first = try? await grabber.grab() else { log?("capture failed"); return nil }
-        log?("start rect \(rect) frame \(first.width)x\(first.height) center \(center)")
+              let first = try? await grabber.grab() else { Log.error("scroll", "could not capture the region"); return nil }
+        Log.info("scroll", "start: region \(Int(rect.width))×\(Int(rect.height)) pt, frame \(first.width)×\(first.height) px, "
+                 + "app under it: \(WindowList.app(at: center) ?? "?")")
         let stitcher = Stitcher(maxHeight: 16000)
         dump(first, 1)
         _ = stitcher.add(first, requestedShift: 0)
-        var frames = 1
+        var glued: CGImage? = first   // the frame the stitcher compares the next one with
+        frames = 1
         let t0 = Date()
         while !stopRequested && frames < 200 {
             let body = CGFloat(stitcher.bodyHeight ?? first.height)
@@ -67,22 +96,51 @@ final class ScrollCapturer {
             Input.scroll(points: stepPt, at: center)
             try? await Task.sleep(nanoseconds: 170_000_000)
             if stopRequested { break }
-            guard var img = try? await grabber.grab() else { break }
+            guard var img = try? await grabber.grab() else { grabFailed(); break }
             frames += 1
             dump(img, frames)
             var step = stitcher.add(img, requestedShift: req)
-            if step == .noChange {   // maybe the app was slow to repaint: look once more
+            if step == .noChange || step == .failed {
+                // The app may still be repainting, loading or animating the scroll: look once more.
+                if step == .failed { Log.info("scroll", "frame \(frames): no match yet (\(stitcher.lastProbe.map { "\($0)" } ?? "")), retrying") }
                 try? await Task.sleep(nanoseconds: 350_000_000)
-                guard let again = try? await grabber.grab() else { break }
+                guard let again = try? await grabber.grab() else { grabFailed(); break }
                 img = again
                 step = stitcher.add(img, requestedShift: req)
             }
             let m = stitcher.lastRaw
-            log?("frame \(frames): \(step) req \(req)px, match shift \(m?.shift ?? -1) hdr \(m?.header ?? -1) ftr \(m?.footer ?? -1) score \(String(format: "%.2f", m?.score ?? -1)), total \(stitcher.height)px")
-            if step == .noChange || step == .failed || step == .full { break }
-            hud?.progress(heightPt: CGFloat(stitcher.height) / scale)
+            Log.info("scroll", "frame \(frames): \(step) req \(req)px, match shift \(m?.shift ?? -1) hdr \(m?.header ?? -1) ftr \(m?.footer ?? -1) score \(String(format: "%.2f", m?.score ?? -1)), total \(stitcher.height)px")
+            switch step {
+            case .first, .appended:
+                glued = img
+                hud?.progress(heightPt: CGFloat(stitcher.height) / scale)
+                continue
+            case .noChange:
+                outcome = "end"
+                Log.info("scroll", "end of the content")
+            case .full:
+                outcome = "full"
+                Log.warn("scroll", "size limit reached")
+                notice = "Достигнут предел длины снимка (\(stitcher.maxHeight) пикселей): дальше страница не снята."
+            case .failed:
+                if stitcher.lastStepShort {
+                    // The previous step already moved less than asked: this is the end, where something
+                    // on the page keeps changing (a video, an animation). Not an error.
+                    outcome = "end"
+                    Log.info("scroll", "end of the content (it keeps changing): \(stitcher.lastProbe.map { "\($0)" } ?? "")")
+                } else {
+                    outcome = "stoppedEarly"
+                    Log.error("scroll", "stopped early, frame \(frames): \(stitcher.lastProbe.map { "\($0)" } ?? "")")
+                    notice = "Прокрутка остановилась раньше конца: страница менялась во время съёмки. Снято до этого места."
+                    saveFailedPair(glued, img)
+                }
+            }
+            break
         }
-        log?(String(format: "done: %d frames, %.1fs", frames, Date().timeIntervalSince(t0)))
+        if stopRequested && outcome == "noCapture" { outcome = "userStopped" }
+        if outcome == "noCapture" { outcome = "end" }   // the 200-frame cap
+        Log.info("scroll", String(format: "done (%@): %d frames, %d px, %.1f s", outcome, frames, stitcher.height,
+                                  Date().timeIntervalSince(t0)))
         return stitcher.compose()
     }
 

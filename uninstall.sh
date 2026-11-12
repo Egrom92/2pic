@@ -22,6 +22,7 @@ if [ -f "$KC" ]; then
     echo "Удалён сертификат подписи 2pic"
 fi
 rm -f "$HOME/Library/Logs/2pic.log"
+rm -rf "$HOME/Library/Logs/2pic" "$HOME/Library/Logs/2pic-scroll-failures" "$HOME/Library/Application Support/2pic"
 defaults delete local.2pic >/dev/null 2>&1
 
 echo "✅ 2pic удалён. Снимки и видео на рабочем столе остались."

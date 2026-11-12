@@ -67,11 +67,42 @@ public struct StitchMatch {
     public let score: Double
 }
 
+/// What a comparison saw, for the log when no offset was accepted.
+public struct StitchProbe: CustomStringConvertible {
+    public var reason = ""
+    public var activeBands = 0
+    public var staticTop = 0       // rows at the top / bottom that didn't change (before capping)
+    public var staticBottom = 0
+    public var height = 0
+    public var expected = 0
+    public var bestShift = -1
+    public var bestScore = 0.0
+
+    /// Most of the frame stayed in place: nothing really scrolled, something on the page just changed
+    /// (a video, an animation). For a capture that means the end of the content.
+    public var mostlyStatic: Bool { height > 0 && staticTop + staticBottom >= height * 6 / 10 }
+
+    public var description: String {
+        "\(reason); active bands \(activeBands)/\(FrameSignature.bands), static top \(staticTop) bottom \(staticBottom) of \(height), "
+            + "best shift \(bestShift) (expected \(expected)) score \(String(format: "%.2f", bestScore))"
+    }
+}
+
 public enum StitchMatcher {
     /// Finds how far the content scrolled from `a` to `b`. `expected` is the scroll we asked for,
     /// in pixels; it breaks ties for repetitive content. Returns nil if no offset fits.
     public static func match(_ a: FrameSignature, _ b: FrameSignature, expected: Int) -> StitchMatch? {
-        guard a.width == b.width, a.height == b.height else { return nil }
+        probe(a, b, expected: expected, confirmed: false).match
+    }
+
+    /// `confirmed`: earlier frames have shown how this content scrolls, so a weaker match right at the
+    /// expected offset is enough (part of the page changed between the frames: a video, an animation).
+    public static func probe(_ a: FrameSignature, _ b: FrameSignature, expected: Int, confirmed: Bool)
+        -> (match: StitchMatch?, probe: StitchProbe) {
+        var pr = StitchProbe()
+        pr.height = a.height
+        pr.expected = expected
+        guard a.width == b.width, a.height == b.height else { pr.reason = "frame size changed"; return (nil, pr) }
         let h = a.height, n = FrameSignature.bands
 
         // Columns (bands) that did not move at all — another window or a fixed sidebar inside the
@@ -86,7 +117,8 @@ public enum StitchMatcher {
             active[k] = detailed > 0 && Double(same) < Double(detailed) * 0.85
         }
         let activeCount = active.filter { $0 }.count
-        if activeCount == 0 { return StitchMatch(shift: 0, header: h, footer: 0, score: 1) }
+        pr.activeBands = activeCount
+        if activeCount == 0 { return (StitchMatch(shift: 0, header: h, footer: 0, score: 1), pr) }
 
         let staticNeed = max(1, activeCount * 9 / 10)
         func equalBands(_ y: Int) -> Int {
@@ -97,16 +129,18 @@ public enum StitchMatcher {
         }
         var top = 0
         while top < h && equalBands(top) >= staticNeed { top += 1 }
-        if top == h { return StitchMatch(shift: 0, header: h, footer: 0, score: 1) }
+        if top == h { return (StitchMatch(shift: 0, header: h, footer: 0, score: 1), pr) }
         var bottom = 0
         while bottom < h - top && equalBands(h - 1 - bottom) >= staticNeed { bottom += 1 }
+        pr.staticTop = top
+        pr.staticBottom = bottom
         let cap = h * 45 / 100
         let T = min(top, cap), F = min(bottom, cap)
         let body = h - T - F
-        guard body > 24 else { return nil }
+        guard body > 24 else { pr.reason = "almost nothing moved"; return (nil, pr) }
         let minOverlap = max(12, body / 10)
         let maxShift = body - minOverlap
-        guard maxShift >= 1 else { return nil }
+        guard maxShift >= 1 else { pr.reason = "almost nothing moved"; return (nil, pr) }
 
         // Detailed active bands of b, per row, and their prefix sums.
         var mask = [UInt8](repeating: 0, count: h * n)
@@ -118,6 +152,7 @@ public enum StitchMatcher {
         }
 
         let exp = min(max(expected, 1), maxShift)
+        pr.expected = exp
         var order: [Int] = [exp]
         order.reserveCapacity(maxShift)
         var d = 1
@@ -130,6 +165,12 @@ public enum StitchMatcher {
         // Pick the offset with the best match ratio, discounted for thin evidence (a few rows of a
         // tiny overlap can match by chance). `order` runs outward from the expected offset, so on
         // equal scores the one closest to the requested scroll wins.
+        //
+        // Each offset is scored on the whole overlap and on its upper half alone. The upper half lies in
+        // the middle of the previous frame, where the content had settled. The lower half was the previous
+        // frame's bottom edge: that's where lazy images, skeleton placeholders of virtualized lists and
+        // entrance animations still show — they look different one frame later and spoil the full score.
+        let floor = 0.5
         var best = -1.0, bestShift = 0, bestRaw = 0.0
         var anyInformative = false
         let minTotal = max(24, activeCount * 4)
@@ -142,29 +183,81 @@ public enum StitchMatcher {
                 let total = pre[y1] - pre[y0]
                 if total < minTotal { continue }
                 anyInformative = true
-                let penalty = 1.5 / Double(total).squareRoot()
-                let allowedMiss = Int(Double(total) * (1 - max(best + penalty, 0.7)))
-                guard allowedMiss >= 0 else { continue }
-                var miss = 0
-                var ok = true
-                rows: for y in y0..<y1 where pre[y + 1] != pre[y] {
+                let mid = y0 + (y1 - y0) / 2
+                let totalUpper = pre[mid] - pre[y0]
+                let upperUsable = totalUpper >= minTotal / 2
+                // Misses beyond these can no longer beat the best offset so far (or reach the floor).
+                let needFull = max(best + 1.5 / Double(total).squareRoot(), floor)
+                let allowFull = Int(Double(total) * (1 - needFull))
+                let needUpper = upperUsable ? max(best + 1.5 / Double(totalUpper).squareRoot() + 0.05, floor + 0.05) : 2
+                let allowUpper = Int(Double(totalUpper) * (1 - needUpper))
+                if allowFull < 0 && allowUpper < 0 { continue }
+                var miss = 0, missUpper = -1
+                var completed = true
+                rows: for y in y0..<y1 {
+                    if y == mid { missUpper = miss }
+                    if pre[y + 1] == pre[y] { continue }
                     let bo = y * n, ao = (y + s) * n
-                    for k in 0..<n where bm[bo + k] != 0 && ah[ao + k] != bh[bo + k] {
-                        miss += 1
-                        if miss > allowedMiss { ok = false; break rows }
-                    }
+                    for k in 0..<n where bm[bo + k] != 0 && ah[ao + k] != bh[bo + k] { miss += 1 }
+                    if miss > allowFull && (missUpper >= 0 || miss > allowUpper) { completed = false; break rows }
                 }
-                if !ok { continue }
-                let raw = 1 - Double(miss) / Double(total)
+                var raw = -1.0, used = total
+                if completed && miss <= allowFull { raw = 1 - Double(miss) / Double(total) }
+                if upperUsable, missUpper >= 0, missUpper <= allowUpper {
+                    let up = 1 - Double(missUpper) / Double(totalUpper) - 0.05
+                    if up > raw { raw = up; used = totalUpper }
+                }
+                guard raw >= 0 else { continue }
+                let penalty = 1.5 / Double(used).squareRoot()
                 if raw - penalty > best + 1e-9 { best = raw - penalty; bestShift = s; bestRaw = raw }
             }
         }}}
         if !anyInformative {
             // Only plain background in the overlap: trust the scroll we requested.
-            return StitchMatch(shift: exp, header: T, footer: F, score: 0)
+            return (StitchMatch(shift: exp, header: T, footer: F, score: 0), pr)
         }
-        guard bestRaw >= 0.7 else { return nil }
-        return StitchMatch(shift: bestShift, header: T, footer: F, score: bestRaw)
+        pr.bestShift = best < 0 ? -1 : bestShift
+        pr.bestScore = bestRaw
+        let near = { (s: Int) in abs(s - exp) <= max(2, exp / 100) }
+        // A clear match anywhere; or a weaker one exactly where the scroll was expected to land.
+        if bestRaw >= 0.7 || (best >= 0 && near(bestShift) && bestRaw >= (confirmed ? 0.5 : 0.6)) {
+            return (StitchMatch(shift: bestShift, header: T, footer: F, score: bestRaw), pr)
+        }
+
+        // Last resort, for a big area that changes on its own (a video, a carousel): it matches at no
+        // offset, but the rest of the page still matches at one offset far better than at its neighbours.
+        // Accept that offset only where the scroll was expected to land.
+        let win = max(40, exp / 6)
+        var scores: [(shift: Int, raw: Double)] = []
+        a.hash.withUnsafeBufferPointer { ah in
+        b.hash.withUnsafeBufferPointer { bh in
+        mask.withUnsafeBufferPointer { bm in
+            for s in max(1, exp - win)...min(maxShift, exp + win) {
+                let y0 = T, y1 = h - F - s
+                guard y1 > y0 else { continue }
+                let total = pre[y1] - pre[y0]
+                if total < minTotal { continue }
+                var miss = 0
+                for y in y0..<y1 where pre[y + 1] != pre[y] {
+                    let bo = y * n, ao = (y + s) * n
+                    for k in 0..<n where bm[bo + k] != 0 && ah[ao + k] != bh[bo + k] { miss += 1 }
+                }
+                scores.append((s, 1 - Double(miss) / Double(total)))
+            }
+        }}}
+        if let top1 = scores.max(by: { $0.raw < $1.raw }) {
+            // The runner-up is looked for more than a text line away: within a line, rows can look alike.
+            let runnerUp = scores.filter { abs($0.shift - top1.shift) > 20 }.map(\.raw).max() ?? 0
+            pr.bestShift = top1.shift
+            pr.bestScore = top1.raw
+            if near(top1.shift) && top1.raw >= 0.25 && top1.raw >= 2.5 * max(runnerUp, 0.04) {
+                return (StitchMatch(shift: top1.shift, header: T, footer: F, score: top1.raw), pr)
+            }
+            pr.reason = String(format: "no distinct offset (best %.2f, runner-up %.2f)", top1.raw, runnerUp)
+        } else {
+            pr.reason = best < 0 ? "no offset matched" : "best offset matched too weakly"
+        }
+        return (nil, pr)
     }
 }
 
@@ -177,9 +270,14 @@ public final class Stitcher {
     public private(set) var lastMatch: StitchMatch?
     /// Result of the latest comparison, including "nothing moved" (nil = no offset fitted).
     public private(set) var lastRaw: StitchMatch?
+    /// What the latest comparison saw (why it failed, if it did).
+    public private(set) var lastProbe: StitchProbe?
+    /// The latest step moved clearly less than asked: the end of the content is near.
+    public private(set) var lastStepShort = false
     private var segments: [CGImage] = []
     private var prev: FrameSignature?
-    private var ratio = 1.0   // measured shift / requested shift
+    private var ratio = 1.0       // measured shift / requested shift
+    private var confirmed = false // a real match has shown how this content scrolls
 
     public init(maxHeight: Int = 16000) { self.maxHeight = maxHeight }
 
@@ -202,28 +300,37 @@ public final class Stitcher {
             return .first
         }
         let expected = Int((Double(requestedShift) * ratio).rounded())
-        let raw = StitchMatcher.match(p, sig, expected: expected)
+        let (raw, probe) = StitchMatcher.probe(p, sig, expected: expected, confirmed: confirmed)
         lastRaw = raw
-        guard let m = raw else { return .failed }
+        lastProbe = probe
+        // Nothing really scrolled and only part of the page changed (a video, an animation): the end.
+        guard let m = raw else { return probe.mostlyStatic ? .noChange : .failed }
         if m.shift == 0 { return .noChange }
         lastMatch = m
+        lastStepShort = m.shift < expected * 3 / 4
         if requestedShift > 0 && m.score > 0 {
             ratio = min(4, max(0.25, Double(m.shift) / Double(requestedShift)))
+            confirmed = true
         }
-        // Drop the previous frame's footer, then append the newly revealed rows plus the footer.
-        let from = img.height - m.footer - m.shift
-        let room = maxHeight - height
-        trim(m.footer)
-        if m.shift >= room {   // size limit: keep what fits, skip the footer
-            if room > 0, let seg = Self.copyRows(img, from, room) { segments.append(seg); height += room }
-            prev = sig
-            return .full
+        // Seam: rows seen in both frames come from the newer frame in the lower two thirds of the overlap.
+        // The previous frame may have shown placeholders there (lazy loading, virtualized lists) that are
+        // filled in now. The upper third, next to a sticky header whose edge may be misjudged, stays as is.
+        let body = img.height - m.header - m.footer
+        let renew = max(0, body - m.shift) * 2 / 3
+        let from = img.height - m.footer - m.shift - renew
+        let kept = height - m.footer - renew   // after dropping the previous frame's footer and the renewed rows
+        var count = m.shift + renew + m.footer
+        var step = Step.appended(m.shift)
+        if kept + count > maxHeight {   // size limit: keep what fits
+            count = max(0, maxHeight - kept)
+            step = .full
         }
-        guard let seg = Self.copyRows(img, from, m.shift + m.footer) else { return .failed }
-        segments.append(seg)
-        height += m.shift + m.footer
+        let seg = count > 0 ? Self.copyRows(img, from, count) : nil
+        if count > 0 && seg == nil { return .failed }
+        trim(m.footer + renew)
+        if let seg { segments.append(seg); height += count }
         prev = sig
-        return .appended(m.shift)
+        return step
     }
 
     private func trim(_ rows: Int) {
@@ -233,7 +340,7 @@ public final class Stitcher {
                 segments.removeLast()
                 n -= last.height
                 height -= last.height
-            } else if let c = last.cropping(to: CGRect(x: 0, y: 0, width: last.width, height: last.height - n)) {
+            } else if let c = Self.copyRows(last, 0, last.height - n) {   // a copy: the cut rows' memory is freed
                 segments[segments.count - 1] = c
                 height -= n
                 n = 0

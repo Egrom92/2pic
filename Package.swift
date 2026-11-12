@@ -13,6 +13,7 @@ let package = Package(
                 .linkedFramework("ScreenCaptureKit"),
                 .linkedFramework("Carbon"),
                 .linkedFramework("ServiceManagement"),
+                .linkedFramework("Vision"),
             ]
         ),
         .executableTarget(name: "StitchCheck", dependencies: ["Stitch"]),
