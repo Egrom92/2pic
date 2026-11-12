@@ -1,11 +1,15 @@
+// Only in debug builds or in an explicit test build (`SELFTEST=1 ./scripts/build.sh`). Never in the build that
+// gets installed for daily use: these commands would let any local program take screenshots, record video and post
+// mouse/keyboard events through 2pic's Screen Recording and Accessibility permissions.
+#if DEBUG || SELFTEST
 import AppKit
 import Carbon.HIToolbox
 import AVFoundation
 import Stitch
 import ServiceManagement
 
-/// Command-line self-tests, run as a separate instance:
-///   open -n /Applications/2pic.app --args --selftest <kind> ...
+/// Command-line self-tests, run as a separate instance of a test build:
+///   open -n build/2pic.app --args --selftest <kind> ...
 /// Kinds:
 ///   export OUT                     capture the screen, burn in sample marks, write OUT and copy to clipboard
 ///   overlay OUT                    show the overlay with a sample selection, screenshot it to OUT
@@ -289,3 +293,4 @@ enum SelfTest {
         throw Failure(description: "clipboard did not change")
     }
 }
+#endif

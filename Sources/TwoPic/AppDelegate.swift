@@ -9,7 +9,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private(set) var overlay: OverlayController?
     private(set) var scroller: ScrollCapturer?
     private var recorder: RegionRecorder?
-    private var recordHUD: RecordingHUD?
+    private var recordHUD: RecordingHUD?      // set from the moment a recording is starting until it stops
+    private var stopWhenStarted = false        // Stop was asked for while the recorder was still starting
     private var stopItem: NSMenuItem?
     private var busy = false
     private var previousApp: NSRunningApplication?
@@ -20,7 +21,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSApp.terminate(nil)
             return
         }
+        #if DEBUG || SELFTEST
         if SelfTest.start(self) { return }
+        #endif
         setupMenu()
         HotKeys.shared.register(keyCode: kVK_ANSI_9, modifiers: cmdKey | shiftKey) { [weak self] in self?.captureArea() }
         HotKeys.shared.register(keyCode: kVK_ANSI_8, modifiers: cmdKey | shiftKey) { [weak self] in self?.captureScrolling() }
@@ -57,7 +60,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) {
         loginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        stopItem?.isHidden = recorder == nil
+        stopItem?.isHidden = recordHUD == nil
     }
 
     @objc private func menuArea() { DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { self.captureArea() } }
@@ -89,14 +92,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func menuStopRecording() { stopRecording() }
 
     func captureArea() {
-        if recorder != nil { stopRecording(); return }   // ⌘⇧9 while recording stops it
+        if recordHUD != nil { stopRecording(); return }   // ⌘⇧9 while recording (or starting to) stops it
         if scroller != nil { return }
         startOverlay(mode: .capture)
     }
 
     func captureScrolling() {
         if let s = scroller { s.stop(); return }   // second ⌘⇧8 stops scrolling
-        if recorder != nil { stopRecording(); return }
+        if recordHUD != nil { stopRecording(); return }
         guard ensureAccessibility() else { return }
         startOverlay(mode: .scrollSelect)
     }
@@ -135,9 +138,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .cancel:
             break
         case .copy:
-            DispatchQueue.main.async { if let img = canvas.render() { Output.copy(img, pxPerPt: pxPerPt) } }
+            DispatchQueue.main.async {
+                guard let img = canvas.render() else { Toast.show("Нечего копировать: выделение пустое"); return }
+                Output.copy(img, pxPerPt: pxPerPt)
+            }
         case .save:
-            DispatchQueue.main.async { if let img = canvas.render() { Output.save(img, pxPerPt: pxPerPt) } }
+            DispatchQueue.main.async {
+                guard let img = canvas.render() else { Toast.show("Нечего сохранять: выделение пустое"); return }
+                do {
+                    let url = try Output.save(img, pxPerPt: pxPerPt)
+                    Toast.show("Сохранено на рабочий стол: \(url.lastPathComponent)")
+                } catch {
+                    self.alert("Не удалось сохранить снимок",
+                               "\(error.localizedDescription)\n\nПроверьте, что у 2pic есть доступ к папке «Рабочий стол»: Системные настройки → Конфиденциальность и безопасность → Файлы и папки.")
+                }
+            }
         case .scroll(let rect):
             startScroll(screen: ov.screen, rect: rect)
         case .record(let rect):
@@ -168,15 +183,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         recordHUD = hud
         hud.show()
         recordingDone = completion
+        stopWhenStarted = false
         Task { @MainActor in
             do {
-                self.recorder = try await RegionRecorder(screen: screen, rect: rect, url: Output.desktopURL(ext: "mp4"),
-                                                         exclude: hud.excludedWindows)
+                let rec = try await RegionRecorder(
+                    screen: screen, rect: rect, url: Output.desktopURL(ext: "mp4"), exclude: hud.excludedWindowIDs,
+                    onInterrupt: { [weak self] _ in Task { @MainActor in self?.stopRecording() } })
+                self.recorder = rec
                 self.setStatusIcon(recording: true)
                 DiagLog.write("record: started \(rect)")
+                if self.stopWhenStarted { self.stopWhenStarted = false; self.stopRecording() }
             } catch {
                 hud.close()
                 self.recordHUD = nil
+                self.stopWhenStarted = false
+                self.recordingDone = nil
                 self.alert("Не удалось начать запись", error.localizedDescription)
                 completion?(nil)
             }
@@ -189,18 +210,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func debugBubble(at cocoaPoint: CGPoint) { recordHUD?.bubble(at: cocoaPoint) }
 
     func stopRecording() {
-        guard let rec = recorder else { return }
+        guard recordHUD != nil else { return }
+        guard let rec = recorder else { stopWhenStarted = true; return }   // still starting: stop as soon as it has
         recorder = nil
         recordHUD?.close()
         recordHUD = nil
         setStatusIcon(recording: false)
         Task { @MainActor in
-            let url = await rec.stop()
-            DiagLog.write("record: stopped, \(rec.frames) frames → \(url?.path ?? "nil")")
-            if let done = self.recordingDone { self.recordingDone = nil; done(url); return }
-            guard let url else { return }
-            Output.copyFile(url)
-            Toast.show("Видео сохранено на рабочий стол и скопировано")
+            let result = await rec.stop()
+            DiagLog.write("record: stopped, \(rec.frames) frames → \(result.url?.path ?? "nil")"
+                          + (result.error.map { ", error: \($0)" } ?? ""))
+            if let done = self.recordingDone { self.recordingDone = nil; done(result.url); return }
+            switch (result.url, result.error) {
+            case (let url?, nil):
+                Output.copyFile(url)
+                Toast.show("Видео сохранено на рабочий стол и скопировано")
+            case (let url?, let error?):
+                Output.copyFile(url)
+                self.alert("Запись видео прервалась",
+                           "\(error.localizedDescription)\n\nЗаписанная часть сохранена на рабочий стол и скопирована.")
+            case (nil, let error?):
+                self.alert("Не удалось записать видео", error.localizedDescription)
+            case (nil, nil):
+                Toast.show("Запись слишком короткая — видео не сохранено")
+            }
         }
     }
 

@@ -2,27 +2,49 @@ import AppKit
 import AVFoundation
 import ScreenCaptureKit
 
+enum RecorderError: LocalizedError {
+    case writeFailed
+    var errorDescription: String? { "Не удалось записать видеофайл." }
+}
+
+/// How a recording ended.
+struct RecordingResult {
+    /// The finished video; nil if no frame was recorded or the file couldn't be written (then it is removed).
+    var url: URL?
+    /// Why the recording failed or stopped early, if it did.
+    var error: Error?
+}
+
 /// Records one screen region to an H.264 .mp4 (ScreenCaptureKit → AVAssetWriter), with the cursor.
-final class RegionRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
+/// The capture/writer state is touched only on `queue`, so the class is safe to hand between threads.
+final class RegionRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     let url: URL
-    private var stream: SCStream?
+    private var stream: SCStream?   // main thread only
     private let writer: AVAssetWriter
     private let input: AVAssetWriterInput
     private let queue = DispatchQueue(label: "2pic.recorder")
+    private let onInterrupt: @Sendable (Error) -> Void
+    // On `queue`:
     private var started = false
     private var lastPTS = CMTime.invalid
+    private var writeError: Error?    // the file can't be written: it is discarded
+    private var streamError: Error?   // capture ended early (display gone, stopped by the system): what we have is kept
+    private var interrupted = false
     private(set) var frames = 0
 
-    /// `rect`: screen-local top-left points. `exclude`: our own HUD windows to keep out of the video.
-    init(screen: NSScreen, rect: CGRect, url: URL, exclude: [NSWindow]) async throws {
+    /// `rect`: screen-local top-left points. `exclude`: IDs of our own HUD windows to keep out of the video.
+    /// `onInterrupt` is called once, from a background queue, if the recording breaks before `stop()`.
+    init(screen: NSScreen, rect: CGRect, url: URL, exclude: [CGWindowID],
+         onInterrupt: @escaping @Sendable (Error) -> Void) async throws {
         self.url = url
+        self.onInterrupt = onInterrupt
         let scale = screen.backingScaleFactor
         // H.264 wants even pixel sizes.
         let wPx = max(2, Int(rect.width * scale) / 2 * 2), hPx = max(2, Int(rect.height * scale) / 2 * 2)
         let src = CGRect(x: rect.minX, y: rect.minY, width: CGFloat(wPx) / scale, height: CGFloat(hPx) / scale)
 
         let content = try await Capture.content()
-        let ids = Set(exclude.map { CGWindowID($0.windowNumber) })
+        let ids = Set(exclude)
         let hidden = content.windows.filter { ids.contains($0.windowID) }
         let filter = SCContentFilter(display: try Capture.display(for: screen, in: content), excludingWindows: hidden)
         let cfg = SCStreamConfiguration()
@@ -64,41 +86,79 @@ final class RegionRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen, sb.isValid,
+        guard writeError == nil, type == .screen, sb.isValid,
               let atts = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               let raw = atts.first?[.status] as? Int, SCFrameStatus(rawValue: raw) == .complete else { return }
         if !started {
-            guard writer.startWriting() else { return }
+            // startWriting() may be called only once: after a failure a second call raises an Objective-C exception
+            // (the app would crash on the next frame), so a failure here ends the recording.
+            guard writer.startWriting() else { writerFailed(); return }
             writer.startSession(atSourceTime: sb.presentationTimeStamp)
             started = true
         }
-        if input.isReadyForMoreMediaData, input.append(sb) {
+        guard input.isReadyForMoreMediaData else { return }   // the encoder is busy: drop this frame
+        if input.append(sb) {
             lastPTS = sb.presentationTimeStamp
             frames += 1
+        } else if writer.status == .failed {
+            writerFailed()
         }
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        DiagLog.write("record: stream stopped: \(error)")
+        queue.async {
+            guard self.streamError == nil else { return }
+            self.streamError = error
+            self.interrupt(error)
+        }
     }
 
-    /// Stops and finalizes the file. Returns the file URL, or nil if nothing was recorded.
-    func stop() async -> URL? {
+    /// On `queue`.
+    private func writerFailed() {
+        guard writeError == nil else { return }
+        let e = writer.error ?? RecorderError.writeFailed
+        writeError = e
+        interrupt(e)
+    }
+
+    /// On `queue`: logs the problem and tells the app once, so it can stop and explain what happened.
+    private func interrupt(_ e: Error) {
+        DiagLog.write("record: interrupted: \(e)")
+        guard !interrupted else { return }
+        interrupted = true
+        onInterrupt(e)
+    }
+
+    /// Stops and finalizes the file. A broken or empty file is removed.
+    func stop() async -> RecordingResult {
         if let s = stream { try? await s.stopCapture() }
         stream = nil
         return await withCheckedContinuation { c in
             queue.async {
-                guard self.started else { c.resume(returning: nil); return }
+                let early = self.streamError
+                if let e = self.writeError { self.discard(); c.resume(returning: RecordingResult(url: nil, error: e)); return }
+                guard self.started, self.writer.status == .writing else {
+                    self.discard()
+                    c.resume(returning: RecordingResult(url: nil, error: early ?? self.writer.error))
+                    return
+                }
                 // ScreenCaptureKit sends frames only when something changes: extend the video to "now".
                 let now = CMClockGetTime(CMClockGetHostTimeClock())
                 self.input.markAsFinished()
                 self.writer.endSession(atSourceTime: self.lastPTS.isValid ? max(now, self.lastPTS) : now)
                 self.writer.finishWriting {
-                    c.resume(returning: self.writer.status == .completed ? self.url : nil)
+                    if self.writer.status == .completed {
+                        c.resume(returning: RecordingResult(url: self.url, error: early))
+                    } else {
+                        self.discard()
+                        c.resume(returning: RecordingResult(url: nil, error: self.writer.error ?? RecorderError.writeFailed))
+                    }
                 }
             }
         }
     }
+
+    private func discard() { try? FileManager.default.removeItem(at: url) }
 }
 
 /// While recording: red outline (not recorded), a stop pill (not recorded), and click bubbles (recorded).
@@ -113,7 +173,7 @@ final class RecordingHUD {
     private var timer: Timer?
     private let t0 = Date()
 
-    var excludedWindows: [NSWindow] { [outline, pillWin] }
+    var excludedWindowIDs: [CGWindowID] { [outline, pillWin].map { CGWindowID($0.windowNumber) } }
 
     init(screen: NSScreen, rect: CGRect, onStop: @escaping () -> Void) {
         let g = Screens.cocoaRect(rect, on: screen)
@@ -276,8 +336,10 @@ enum Toast {
         window = p
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) {
             NSAnimationContext.runAnimationGroup({ $0.duration = 0.4; p.animator().alphaValue = 0 }) {
-                p.orderOut(nil)
-                if window === p { window = nil }
+                MainActor.assumeIsolated {   // AppKit runs this completion on the main thread
+                    p.orderOut(nil)
+                    if window === p { window = nil }
+                }
             }
         }
     }
