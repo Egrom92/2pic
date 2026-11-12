@@ -238,10 +238,18 @@ final class CanvasView: NSView {
     // MARK: mouse
 
     private var hadSelection = false
+    private var selectionAtDown: CGRect?
+    private static let minSelection: CGFloat = 6   // image pixels; smaller frames are treated as a slip of the mouse
+
+    private func isUsable(_ r: CGRect?) -> Bool {
+        guard let r else { return false }
+        return r.width >= Self.minSelection && r.height >= Self.minSelection
+    }
 
     override func mouseDown(with e: NSEvent) {
         let p = location(e)
         hadSelection = selection != nil
+        selectionAtDown = selection
         downPoint = p
         dragging = false
         guard isEditing, let sel = selection else { drag = .select(p); return }
@@ -315,8 +323,10 @@ final class CanvasView: NSView {
                 selection = hover ?? imageBounds          // click: the window under the cursor, or the whole screen
             }
             defer { if firstSelection && mode == .capture && selection != nil { setTool(.arrow) } }
-            guard let sel = selection, sel.width >= 6, sel.height >= 6 else {
-                if mode != .editResult { selection = nil }
+            guard let sel = selection, isUsable(sel) else {
+                // Too thin to be meant: keep the frame that was there before (none on the first selection),
+                // instead of losing it or leaving an empty one that would copy nothing.
+                selection = selectionAtDown
                 return
             }
             hover = nil
@@ -328,6 +338,8 @@ final class CanvasView: NSView {
         case .draw:
             if let c = current, c.isMeaningful { annotations.append(c) }
             current = nil
+        case .resize(_, let orig):
+            if !isUsable(selection) { selection = orig }   // an edge dragged onto the opposite one
         default:
             break
         }

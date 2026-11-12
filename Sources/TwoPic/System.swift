@@ -196,11 +196,18 @@ enum Output {
         return url
     }
 
+    enum SaveError: LocalizedError {
+        case encode
+        var errorDescription: String? { "Не удалось закодировать снимок в PNG." }
+    }
+
+    /// Writes a PNG to the Desktop and returns where it went.
     @discardableResult
-    static func save(_ img: CGImage, pxPerPt: CGFloat) -> URL? {
-        guard let png = encode(img, type: .png, dpi: 72 * pxPerPt) else { return nil }
+    static func save(_ img: CGImage, pxPerPt: CGFloat) throws -> URL {
+        guard let png = encode(img, type: .png, dpi: 72 * pxPerPt) else { throw SaveError.encode }
         let url = desktopURL(ext: "png")
-        do { try png.write(to: url); return url } catch { NSLog("2pic: save failed: %@", "\(error)"); return nil }
+        try png.write(to: url)
+        return url
     }
 
     /// Puts a file on the clipboard (⌘V in a messenger attaches it).

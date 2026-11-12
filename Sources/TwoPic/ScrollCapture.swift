@@ -10,6 +10,8 @@ final class ScrollCapturer {
     private var stopRequested = false
     private var hud: ScrollHUD?
     private var escKey: UInt32?
+    private var stopTap: CFMachPort?
+    private var stopTapSource: CFRunLoopSource?
     private var clickMonitor: Any?
     private var keyMonitor: Any?
     var log: ((String) -> Void)?
@@ -32,12 +34,17 @@ final class ScrollCapturer {
         hud = ScrollHUD(screen: screen, rect: rect) { [weak self] in self?.stop() }
         hud?.show()
         escKey = HotKeys.shared.register(keyCode: kVK_Escape, modifiers: 0) { [weak self] in self?.stop() }
-        clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
-            self?.stop()
-        }
-        // Any key stops scrolling (needs Accessibility / Input Monitoring; Esc above works without it).
-        keyMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { [weak self] _ in
-            self?.stop()
+        // Any click or key stops scrolling. The event tap also swallows it, so it doesn't reach the app being
+        // captured (the cursor sits in the middle of its page: a click there could follow a link, a key could
+        // submit a form). If the tap can't be created, fall back to monitors, which only watch.
+        if !installStopTap() {
+            log?("event tap unavailable, using monitors")
+            clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+                self?.stop()
+            }
+            keyMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { [weak self] _ in
+                self?.stop()
+            }
         }
         defer { cleanup() }
 
@@ -79,9 +86,46 @@ final class ScrollCapturer {
         return stitcher.compose()
     }
 
+    /// Active event tap (needs Accessibility, which scrolling capture requires anyway) that turns any mouse
+    /// button or key into "stop" and drops it. Button-up / key-up events are dropped too, so the app never
+    /// sees half a click. Runs on the main run loop.
+    private func installStopTap() -> Bool {
+        let types: [CGEventType] = [.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
+                                    .otherMouseDown, .otherMouseUp, .keyDown, .keyUp]
+        let mask = types.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
+        let callback: CGEventTapCallBack = { _, type, event, refcon in
+            guard let refcon else { return Unmanaged.passUnretained(event) }
+            let me = Unmanaged<ScrollCapturer>.fromOpaque(refcon).takeUnretainedValue()
+            return MainActor.assumeIsolated {   // the tap's source is on the main run loop
+                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                    if let tap = me.stopTap { CGEvent.tapEnable(tap: tap, enable: true) }
+                    return Unmanaged.passUnretained(event)
+                }
+                me.stop()
+                return nil
+            }
+        }
+        guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
+                                          eventsOfInterest: mask, callback: callback,
+                                          userInfo: Unmanaged.passUnretained(self).toOpaque()),
+              let source = CFMachPortCreateRunLoopSource(nil, tap, 0) else { return false }
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+        stopTap = tap
+        stopTapSource = source
+        return true
+    }
+
     private func cleanup() {
         HotKeys.shared.unregister(escKey)
         escKey = nil
+        if let tap = stopTap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+            if let s = stopTapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), s, .commonModes) }
+            CFMachPortInvalidate(tap)
+        }
+        stopTap = nil
+        stopTapSource = nil
         if let m = clickMonitor { NSEvent.removeMonitor(m) }
         clickMonitor = nil
         if let m = keyMonitor { NSEvent.removeMonitor(m) }
