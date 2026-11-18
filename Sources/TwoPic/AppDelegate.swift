@@ -184,8 +184,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             do {
                 let shot = try await Capture.screen(screen)
                 let pxPerPt = CGFloat(shot.width) / screen.frame.width
-                let windows = WindowList.rects(on: screen, pxPerPt: pxPerPt)
-                self.present(OverlayController(screen: screen, base: shot, mode: mode, windows: windows, pxPerPt: pxPerPt))
+                let windows = WindowList.entries(on: screen, pxPerPt: pxPerPt)
+                let ov = OverlayController(screen: screen, base: shot, mode: mode,
+                                           windows: windows.map { WindowTarget(frame: $0.px) }, pxPerPt: pxPerPt)
+                self.present(ov)
+                self.findBrowserPages(windows, on: screen, pxPerPt: pxPerPt, in: ov)
                 let ms = Date().timeIntervalSince(t0) * 1000
                 Usage.measure("overlay.ms", ms)
                 Log.info("capture", String(format: "%@ via %@: screen %d×%d px, %d windows, over %@, shown in %.0f ms",
@@ -194,6 +197,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } catch {
                 Log.error("capture", "screen capture failed: \(error)")
                 self.alert("Не удалось сделать снимок", "\(error.localizedDescription)\n\nЕсли вы только что выдали доступ к записи экрана — перезапустите 2pic.")
+            }
+        }
+    }
+
+    /// Looks for the page area of browser windows while the overlay is already up, then lets hover use it.
+    private func findBrowserPages(_ windows: [WindowList.Entry], on screen: NSScreen, pxPerPt: CGFloat, in ov: OverlayController) {
+        guard windows.contains(where: { BrowserPage.isBrowser(pid: $0.pid) }) else { return }
+        Task.detached(priority: .userInitiated) {
+            let t0 = Date()
+            let targets = WindowList.targets(windows, on: screen, pxPerPt: pxPerPt)
+            let ms = Date().timeIntervalSince(t0) * 1000
+            await MainActor.run {
+                let found = targets.filter { $0.page != nil }.count
+                Log.info("capture", String(format: "browser pages: %d found in %.0f ms (accessibility: %@)",
+                                           found, ms, AXIsProcessTrusted() ? "yes" : "no"))
+                ov.canvas.updateWindows(targets)
             }
         }
     }

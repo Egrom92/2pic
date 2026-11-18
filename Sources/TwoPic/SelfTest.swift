@@ -69,7 +69,7 @@ enum SelfTest {
             let shot = try await Capture.screen(screen)
             let s = CGFloat(shot.width) / screen.frame.width
             let ov = OverlayController(screen: screen, base: shot, mode: .capture,
-                                       windows: WindowList.rects(on: screen, pxPerPt: s), pxPerPt: s)
+                                       windows: WindowList.rects(on: screen, pxPerPt: s).map { WindowTarget(frame: $0) }, pxPerPt: s)
             app.present(ov)
             let sel = CGRect(x: shot.width / 5, y: shot.height / 6, width: shot.width * 3 / 5, height: shot.height / 2)
             ov.canvas.debugSet(selection: sel, annotations: sampleMarks(sel, s), tool: nil)
@@ -209,6 +209,16 @@ enum SelfTest {
             try await Task.sleep(nanoseconds: 400_000_000)
             key(kVK_ANSI_C, [.maskCommand])
             try await saveClipboard(after: before, to: a[2])
+        case "browsers":   // browsers — the page area found in every browser window on screen, and its AX outline
+            log("accessibility trusted: \(AXIsProcessTrusted())")
+            for e in WindowList.entries(on: screen, pxPerPt: screen.backingScaleFactor) where BrowserPage.isBrowser(pid: e.pid) {
+                let name = NSRunningApplication(processIdentifier: e.pid)?.bundleIdentifier ?? "?"
+                let t0 = Date()
+                let page = BrowserPage.pageRect(pid: e.pid, window: e.global)
+                log(String(format: "%@ window %@ → page %@ (%.0f ms)", name, "\(e.global)", page.map { "\($0)" } ?? "none",
+                           Date().timeIntervalSince(t0) * 1000))
+                if page == nil || a.first == "outline" { log(BrowserPage.outline(pid: e.pid, window: e.global)) }
+            }
         default:
             throw Failure(description: "unknown self-test \(kind)")
         }
@@ -319,9 +329,10 @@ enum UICheck {
         let size = CGSize(width: 900, height: 560)
         let front = CGRect(x: 120 * s, y: 80 * s, width: 420 * s, height: 300 * s)
         let back = CGRect(x: 480 * s, y: 200 * s, width: 360 * s, height: 280 * s)
+        let backPage = CGRect(x: back.minX, y: back.minY + 60 * s, width: back.width, height: back.height - 60 * s)
         let base = syntheticScreen(size, front: front, back: back)
         let canvas = CanvasView(frame: CGRect(origin: .zero, size: size), base: base, pxPerPt: s, mode: .capture,
-                                windows: [front, back])
+                                windows: [WindowTarget(frame: front), WindowTarget(frame: back, page: backPage)])
         let win = NSWindow(contentRect: CGRect(origin: CGPoint(x: -30000, y: -30000), size: size),
                            styleMask: [.borderless], backing: .buffered, defer: false)
         win.contentView = canvas
@@ -330,7 +341,9 @@ enum UICheck {
         canvas.pointerMoved(to: CGPoint(x: 500, y: 250))
         check(canvas.hover == front, "pointer over two windows highlights the front one")
         canvas.pointerMoved(to: CGPoint(x: 700, y: 400))
-        check(canvas.hover == back, "pointer over the back window highlights it")
+        check(canvas.hover == backPage, "pointer over a browser page highlights only the page")
+        canvas.pointerMoved(to: CGPoint(x: 700, y: 220))
+        check(canvas.hover == back, "pointer over the browser's tabs and address bar highlights the whole window")
         canvas.pointerMoved(to: CGPoint(x: 300, y: 200))
         click(win, CGPoint(x: 300, y: 200))
         check(canvas.selection == front, "click without moving selects the window under the cursor")

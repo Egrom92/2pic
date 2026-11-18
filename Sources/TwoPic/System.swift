@@ -131,14 +131,23 @@ final class RegionGrabber {
 // MARK: - Window rectangles for "click a window" selection
 
 enum WindowList {
+    /// A normal app window on a screen: its frame in image pixels (top-left origin) and what is needed to look
+    /// for a browser page in it.
+    struct Entry {
+        let px: CGRect
+        let pid: pid_t
+        let global: CGRect      // Quartz global points, top-left origin (as the Accessibility API uses)
+    }
+
     /// Frames of normal app windows on `screen`, front to back, in image pixels (top-left origin).
-    static func rects(on screen: NSScreen, pxPerPt: CGFloat) -> [CGRect] {
+    static func rects(on screen: NSScreen, pxPerPt: CGFloat) -> [CGRect] { entries(on: screen, pxPerPt: pxPerPt).map(\.px) }
+
+    static func entries(on screen: NSScreen, pxPerPt: CGFloat) -> [Entry] {
         guard let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
                 as? [[String: Any]] else { return [] }
         let disp = CGDisplayBounds(Screens.displayID(screen))
-        let local = CGRect(origin: .zero, size: disp.size)
         let me = ProcessInfo.processInfo.processIdentifier
-        var out: [CGRect] = []
+        var out: [Entry] = []
         for w in info {
             guard (w[kCGWindowLayer as String] as? Int) == 0,
                   let pid = w[kCGWindowOwnerPID as String] as? Int32, pid != me,
@@ -146,12 +155,33 @@ enum WindowList {
                   let r = CGRect(dictionaryRepresentation: bd) else { continue }
             if let a = w[kCGWindowAlpha as String] as? Double, a < 0.05 { continue }
             if r.width < 40 || r.height < 40 { continue }
-            let l = r.offsetBy(dx: -disp.minX, dy: -disp.minY).intersection(local)
-            if l.isNull || l.width < 20 || l.height < 20 { continue }
-            out.append(CGRect(x: l.minX * pxPerPt, y: l.minY * pxPerPt,
-                              width: l.width * pxPerPt, height: l.height * pxPerPt).integral)
+            guard let px = toImage(r, disp: disp, pxPerPt: pxPerPt), px.width >= 20 * pxPerPt, px.height >= 20 * pxPerPt
+            else { continue }
+            out.append(Entry(px: px, pid: pid, global: r))
         }
         return out
+    }
+
+    /// Windows as click targets, with the page area of browser windows (Accessibility calls: run off the main thread).
+    static func targets(_ entries: [Entry], on screen: NSScreen, pxPerPt: CGFloat) -> [WindowTarget] {
+        let disp = CGDisplayBounds(Screens.displayID(screen))
+        var browser: [pid_t: Bool] = [:]
+        return entries.map { e in
+            var t = WindowTarget(frame: e.px)
+            let isBrowser = browser[e.pid] ?? BrowserPage.isBrowser(pid: e.pid)
+            browser[e.pid] = isBrowser
+            if isBrowser, let g = BrowserPage.pageRect(pid: e.pid, window: e.global),
+               let px = toImage(g, disp: disp, pxPerPt: pxPerPt)?.intersection(e.px), !px.isNull {
+                t.page = px
+            }
+            return t
+        }
+    }
+
+    private static func toImage(_ r: CGRect, disp: CGRect, pxPerPt: CGFloat) -> CGRect? {
+        let l = r.offsetBy(dx: -disp.minX, dy: -disp.minY).intersection(CGRect(origin: .zero, size: disp.size))
+        if l.isNull || l.width < 1 || l.height < 1 { return nil }
+        return CGRect(x: l.minX * pxPerPt, y: l.minY * pxPerPt, width: l.width * pxPerPt, height: l.height * pxPerPt).integral
     }
 }
 

@@ -53,7 +53,8 @@ final class CanvasView: NSView, NSTextFieldDelegate {
     private var redoStack: [[Annotation]] = []
     private var colorIndex = Settings.markColor
     private var sizeIndex = Settings.markSize
-    private let windowRects: [CGRect]
+    private var windowTargets: [WindowTarget]
+    private var lastPointer: CGPoint?   // view points: where hover was last worked out
     private(set) var hover: CGRect?
     private var drag: Drag = .none
     private var dragging = false
@@ -80,11 +81,11 @@ final class CanvasView: NSView, NSTextFieldDelegate {
 
     private let topMargin: CGFloat = 36, bottomMargin: CGFloat = 64
 
-    init(frame: CGRect, base: CGImage, pxPerPt: CGFloat, mode: OverlayMode, windows: [CGRect]) {
+    init(frame: CGRect, base: CGImage, pxPerPt: CGFloat, mode: OverlayMode, windows: [WindowTarget]) {
         self.mode = mode
         self.base = base
         self.pxPerPt = pxPerPt
-        self.windowRects = windows
+        self.windowTargets = windows
         if mode == .editResult {
             let availW = frame.width - 80, availH = frame.height - topMargin - bottomMargin
             let s = min(1 / pxPerPt, availW / CGFloat(base.width))
@@ -615,7 +616,7 @@ final class CanvasView: NSView, NSTextFieldDelegate {
             var kind = "drag"
             if !dragging {
                 guard selection == nil else { return }   // stray click outside: keep the selection
-                kind = hover != nil ? "window" : "screen"
+                kind = hover == nil ? "screen" : windowTargets.contains { $0.page == hover } ? "page" : "window"
                 selection = hover ?? imageBounds          // click: the window under the cursor, or the whole screen
             }
             defer { if firstSelection && mode == .capture && selection != nil { setTool(.arrow) } }
@@ -658,6 +659,13 @@ final class CanvasView: NSView, NSTextFieldDelegate {
 
     override func mouseMoved(with e: NSEvent) { pointerMoved(to: location(e)) }
 
+    /// Browser pages found after the overlay opened (the Accessibility lookup takes a moment): hover follows them.
+    func updateWindows(_ targets: [WindowTarget]) {
+        guard targets.count == windowTargets.count else { return }
+        windowTargets = targets
+        if let p = lastPointer { pointerMoved(to: p) } else { syncWithMouse() }
+    }
+
     /// Highlights the window under the mouse right away, without waiting for the mouse to move.
     func syncWithMouse() {
         guard let w = window else { return }
@@ -665,9 +673,10 @@ final class CanvasView: NSView, NSTextFieldDelegate {
     }
 
     func pointerMoved(to p: CGPoint) {
+        lastPointer = p
         if selection == nil && mode != .editResult {
             let ip = toImage(p)
-            let h = windowRects.first { $0.contains(ip) }
+            let h = windowTargets.first { $0.frame.contains(ip) }?.target(at: ip)
             if h != hover { hover = h; refresh() }
         }
         updateCursor(p)
@@ -882,7 +891,7 @@ final class OverlayController {
     let screen: NSScreen
     var onFinish: ((OverlayController, Outcome) -> Void)?
 
-    init(screen: NSScreen, base: CGImage, mode: OverlayMode, windows: [CGRect], pxPerPt: CGFloat) {
+    init(screen: NSScreen, base: CGImage, mode: OverlayMode, windows: [WindowTarget], pxPerPt: CGFloat) {
         self.screen = screen
         panel = OverlayPanel(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel],
                              backing: .buffered, defer: false)
