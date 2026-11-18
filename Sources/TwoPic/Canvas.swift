@@ -38,7 +38,7 @@ private enum Drag {
 /// View coordinates are top-left points; selection and marks are stored in image pixels.
 final class CanvasView: NSView, NSTextFieldDelegate {
     let mode: OverlayMode
-    let base: CGImage
+    private(set) var base: CGImage
     let pxPerPt: CGFloat
     private(set) var imageRect: CGRect
     var scale: CGFloat { imageRect.width / CGFloat(base.width) }   // view points per image pixel
@@ -60,6 +60,8 @@ final class CanvasView: NSView, NSTextFieldDelegate {
     private var dragging = false
     private var downPoint = CGPoint.zero
     var onFinish: ((Outcome) -> Void)?
+    /// A click took a window or a browser page: the owner fetches that window alone and calls `replaceWindow`.
+    var onPickWindow: ((WindowTarget) -> Void)?
 
     private let imageView: ImageLayerView
     private let marksView = MarksView()
@@ -627,6 +629,10 @@ final class CanvasView: NSView, NSTextFieldDelegate {
                 selection = selectionAtDown
                 return
             }
+            if mode == .capture, kind == "window" || kind == "page",
+               let t = windowTargets.first(where: { $0.frame == sel || $0.page == sel }) {
+                onPickWindow?(t)
+            }
             hover = nil
             Usage.count(firstSelection ? "select.\(kind)" : "frame.reselect")
             Log.info("editor", "selected \(firstSelection ? kind : "anew"): \(Int(sel.width))×\(Int(sel.height)) px")
@@ -659,6 +665,23 @@ final class CanvasView: NSView, NSTextFieldDelegate {
     override func rightMouseDown(with event: NSEvent) { finish(.cancel, via: "rightClick") }
 
     override func mouseMoved(with e: NSEvent) { pointerMoved(to: location(e)) }
+
+    /// Puts the picture of one window, taken on its own, over the frozen screen: what covered it is gone.
+    /// `rect`: the whole window in image pixels, top-left origin.
+    func replaceWindow(_ img: CGImage, at rect: CGRect) {
+        let w = base.width, h = base.height
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: base.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+        else { return }
+        ctx.draw(base, in: CGRect(x: 0, y: 0, width: w, height: h))
+        ctx.draw(img, in: CGRect(x: rect.minX, y: CGFloat(h) - rect.maxY, width: rect.width, height: rect.height))
+        guard let composed = ctx.makeImage() else { return }
+        base = composed
+        imageView.image = composed
+        blurred = nil
+        refresh()
+    }
 
     /// Browser pages found after the overlay opened (the Accessibility lookup takes a moment): hover follows them.
     func updateWindows(_ targets: [WindowTarget]) {
@@ -801,7 +824,7 @@ final class MarkTextField: NSTextField {
 
 /// Shows the frozen screenshot / stitched image as a layer (GPU, no redraw cost).
 final class ImageLayerView: NSView {
-    let image: CGImage
+    var image: CGImage { didSet { layer?.contents = image } }
     init(image: CGImage) {
         self.image = image
         super.init(frame: .zero)

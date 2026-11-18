@@ -6,6 +6,8 @@ import ApplicationServices
 struct WindowTarget: Equatable {
     var frame: CGRect
     var page: CGRect? = nil
+    var windowID: CGWindowID? = nil   // to take the window on its own, without what lies over it
+    var full: CGRect? = nil           // the whole window, also the part off this screen
 
     /// What the pointer at `p` highlights: the page when it is over the page, otherwise the whole window.
     func target(at p: CGPoint) -> CGRect { page.map { $0.contains(p) ? $0 : frame } ?? frame }

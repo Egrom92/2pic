@@ -108,6 +108,21 @@ enum Capture {
         let cfg = config(rect: CGRect(origin: .zero, size: s.frame.size), scale: s.backingScaleFactor, cursor: cursor)
         return try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg)
     }
+
+    /// One window on its own, as if nothing covered it (macOS keeps every window's whole picture):
+    /// `size` in pixels. Nil if the window is gone.
+    static func window(_ id: CGWindowID, size: CGSize) async throws -> CGImage? {
+        let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+        guard let w = content.windows.first(where: { $0.windowID == id }) else { return nil }
+        let c = SCStreamConfiguration()
+        c.width = Int(size.width.rounded())
+        c.height = Int(size.height.rounded())
+        c.showsCursor = false
+        c.captureResolution = .best
+        c.ignoreShadowsSingleWindow = true
+        return try await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(desktopIndependentWindow: w),
+                                                          configuration: c)
+    }
 }
 
 /// Repeatedly grabs one region of the screen, leaving out 2pic's own windows.
@@ -135,8 +150,12 @@ enum WindowList {
     /// for a browser page in it.
     struct Entry {
         let px: CGRect
+        let full: CGRect        // the whole window in image pixels, not cut at the screen edge
+        let id: CGWindowID
         let pid: pid_t
         let global: CGRect      // Quartz global points, top-left origin (as the Accessibility API uses)
+
+        var target: WindowTarget { WindowTarget(frame: px, windowID: id, full: full) }
     }
 
     /// Frames of normal app windows on `screen`, front to back, in image pixels (top-left origin).
@@ -151,13 +170,16 @@ enum WindowList {
         for w in info {
             guard (w[kCGWindowLayer as String] as? Int) == 0,
                   let pid = w[kCGWindowOwnerPID as String] as? Int32, pid != me,
+                  let id = w[kCGWindowNumber as String] as? CGWindowID,
                   let bd = w[kCGWindowBounds as String] as? NSDictionary,
                   let r = CGRect(dictionaryRepresentation: bd) else { continue }
             if let a = w[kCGWindowAlpha as String] as? Double, a < 0.05 { continue }
             if r.width < 40 || r.height < 40 { continue }
             guard let px = toImage(r, disp: disp, pxPerPt: pxPerPt), px.width >= 20 * pxPerPt, px.height >= 20 * pxPerPt
             else { continue }
-            out.append(Entry(px: px, pid: pid, global: r))
+            let full = CGRect(x: (r.minX - disp.minX) * pxPerPt, y: (r.minY - disp.minY) * pxPerPt,
+                              width: r.width * pxPerPt, height: r.height * pxPerPt).integral
+            out.append(Entry(px: px, full: full, id: id, pid: pid, global: r))
         }
         return out
     }
@@ -167,7 +189,7 @@ enum WindowList {
         let disp = CGDisplayBounds(Screens.displayID(screen))
         var browser: [pid_t: Bool] = [:]
         return entries.map { e in
-            var t = WindowTarget(frame: e.px)
+            var t = e.target
             let isBrowser = browser[e.pid] ?? BrowserPage.isBrowser(pid: e.pid)
             browser[e.pid] = isBrowser
             if isBrowser, let g = BrowserPage.pageRect(pid: e.pid, window: e.global),
@@ -178,7 +200,7 @@ enum WindowList {
         }
     }
 
-    private static func toImage(_ r: CGRect, disp: CGRect, pxPerPt: CGFloat) -> CGRect? {
+    static func toImage(_ r: CGRect, disp: CGRect, pxPerPt: CGFloat) -> CGRect? {
         let l = r.offsetBy(dx: -disp.minX, dy: -disp.minY).intersection(CGRect(origin: .zero, size: disp.size))
         if l.isNull || l.width < 1 || l.height < 1 { return nil }
         return CGRect(x: l.minX * pxPerPt, y: l.minY * pxPerPt, width: l.width * pxPerPt, height: l.height * pxPerPt).integral

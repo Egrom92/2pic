@@ -186,7 +186,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let pxPerPt = CGFloat(shot.width) / screen.frame.width
                 let windows = WindowList.entries(on: screen, pxPerPt: pxPerPt)
                 let ov = OverlayController(screen: screen, base: shot, mode: mode,
-                                           windows: windows.map { WindowTarget(frame: $0.px) }, pxPerPt: pxPerPt)
+                                           windows: windows.map(\.target), pxPerPt: pxPerPt)
+                ov.canvas.onPickWindow = { [weak ov] t in
+                    guard let id = t.windowID, let full = t.full else { return }
+                    Task { @MainActor in
+                        let t0 = Date()
+                        do {
+                            guard let img = try await Capture.window(id, size: full.size) else { return }
+                            ov?.canvas.replaceWindow(img, at: full)
+                            Log.info("capture", String(format: "window taken on its own (nothing over it): %d×%d px in %.0f ms",
+                                                       img.width, img.height, Date().timeIntervalSince(t0) * 1000))
+                        } catch {
+                            Log.error("capture", "taking the window on its own failed, keeping the frozen screen: \(error)")
+                        }
+                    }
+                }
                 self.present(ov)
                 self.findBrowserPages(windows, on: screen, pxPerPt: pxPerPt, in: ov)
                 let ms = Date().timeIntervalSince(t0) * 1000
