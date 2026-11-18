@@ -64,7 +64,8 @@ enum BrowserPage {
                 }
                 continue
             }
-            if role == "AXToolbar" || role == "AXTabGroup", let f = frame(e) { bars.append(f) }
+            // A bar is a strip: Safari's tab group, for one, holds the whole window and is no bar.
+            if role == "AXToolbar" || role == "AXTabGroup", let f = frame(e), f.height < window.height * 0.3 { bars.append(f) }
             if depth < 16, let kids = attr(e, kAXChildrenAttribute) as? [AXUIElement] {
                 queue += kids.map { ($0, depth + 1) }
             }

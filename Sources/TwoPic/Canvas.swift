@@ -616,6 +616,7 @@ final class CanvasView: NSView, NSTextFieldDelegate {
             var kind = "drag"
             if !dragging {
                 guard selection == nil else { return }   // stray click outside: keep the selection
+                pointerMoved(to: location(e))            // what is under the click itself, even if no move came first
                 kind = hover == nil ? "screen" : windowTargets.contains { $0.page == hover } ? "page" : "window"
                 selection = hover ?? imageBounds          // click: the window under the cursor, or the whole screen
             }
