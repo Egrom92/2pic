@@ -118,6 +118,11 @@ final class SettingsController: NSObject {
         return (kind, f)
     })
     private let hotkeyStatus = NSTextField(wrappingLabelWithString: "")
+    private var grid: NSGridView?
+    /// The server rows are for whoever runs their own 2pic server; others never see them.
+    /// Shown when a server is already set, or when Settings is opened with ⌥ held.
+    private var showServer = false
+    private static let serverRows = 8...13
 
     var isShown: Bool { window?.isVisible == true }
 
@@ -132,6 +137,7 @@ final class SettingsController: NSObject {
         Usage.count("settings.open")
         let first = window == nil
         if first { window = makeWindow() }
+        showServer = showServer || NSEvent.modifierFlags.contains(.option) || !Telemetry.endpoint.isEmpty || Telemetry.enabled
         update()
         NSApp.activate(ignoringOtherApps: true)
         if first { window?.center() }
@@ -229,6 +235,7 @@ final class SettingsController: NSObject {
         grid.row(at: 5).bottomPadding = 10   // a gap between the folder and the format groups
         grid.row(at: 7).bottomPadding = 10   // … and before the server group
         grid.translatesAutoresizingMaskIntoConstraints = false
+        self.grid = grid
 
         let content = NSView()
         content.addSubview(grid)
@@ -259,6 +266,10 @@ final class SettingsController: NSObject {
         urlField.stringValue = Telemetry.endpoint
         tokenField.stringValue = Telemetry.token
         for (kind, f) in shortcutFields { f.shortcut = kind.shortcut }
+        if let grid {
+            for i in Self.serverRows { grid.row(at: i).isHidden = !showServer }
+            grid.row(at: 7).bottomPadding = showServer ? 10 : 0
+        }
     }
 
     // MARK: shortcuts
