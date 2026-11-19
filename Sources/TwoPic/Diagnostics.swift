@@ -306,8 +306,8 @@ enum Usage {
 
     private static let sections: [(title: String, items: [(String, String)])] = [
         ("Как начинают снимок", [
-            ("start.area.hotkey", "⌘⇧9 — горячей клавишей"), ("start.area.menu", "Снимок — из меню"),
-            ("start.scroll.hotkey", "⌘⇧8 прокрутка — горячей клавишей"), ("start.scroll.menu", "Прокрутка — из меню")]),
+            ("start.area.hotkey", "Снимок — горячей клавишей"), ("start.area.menu", "Снимок — из меню"),
+            ("start.scroll.hotkey", "Прокрутка — горячей клавишей"), ("start.scroll.menu", "Прокрутка — из меню")]),
         ("Что выделяют", [
             ("select.window", "Окно (клик по окну)"), ("select.drag", "Область (протянуть мышью)"),
             ("select.screen", "Весь экран (клик мимо окон)"), ("select.enter", "Сразу Enter/⌘C, без выделения")]),

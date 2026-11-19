@@ -14,11 +14,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var recordStarted: Date?
     private var stopItem: NSMenuItem?
     private var busy = false
+    private var hotkeyIDs: [HotkeyKind: UInt32] = [:]
+    private var menuItems: [HotkeyKind: NSMenuItem] = [:]
     private var previousApp: NSRunningApplication?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if CommandLine.arguments.contains("--unregister-login") {   // used by uninstall.sh
             try? SMAppService.mainApp.unregister()
+            SystemShortcuts.restoreUnused(inUse: [])   // give back ⌘⇧4 etc. if 2pic had taken them
             NSApp.terminate(nil)
             return
         }
@@ -31,13 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Log.session()
         Telemetry.start()
         setupMenu()
-        let area = HotKeys.shared.register(keyCode: kVK_ANSI_9, modifiers: cmdKey | shiftKey) { [weak self] in
-            self?.captureArea(via: "hotkey")
-        }
-        let scroll = HotKeys.shared.register(keyCode: kVK_ANSI_8, modifiers: cmdKey | shiftKey) { [weak self] in
-            self?.captureScrolling(via: "hotkey")
-        }
-        let taken = [(area, "⌘⇧9"), (scroll, "⌘⇧8")].filter { $0.0 == nil }.map(\.1)
+        let taken = HotkeyKind.allCases.compactMap { register($0) ? nil : $0.shortcut.display }
         enableLoginItemOnce()
         observeSystem()
         if !CGPreflightScreenCaptureAccess() {
@@ -78,10 +75,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.button?.image = img
         let menu = NSMenu()
         menu.delegate = self
-        let area = NSMenuItem(title: "Снимок области или окна", action: #selector(menuArea), keyEquivalent: "9")
-        area.keyEquivalentModifierMask = [.command, .shift]
-        let scroll = NSMenuItem(title: "Снимок с прокруткой", action: #selector(menuScroll), keyEquivalent: "8")
-        scroll.keyEquivalentModifierMask = [.command, .shift]
+        let area = NSMenuItem(title: "Снимок области или окна", action: #selector(menuArea), keyEquivalent: "")
+        let scroll = NSMenuItem(title: "Снимок с прокруткой", action: #selector(menuScroll), keyEquivalent: "")
+        menuItems = [.area: area, .scroll: scroll]
+        HotkeyKind.allCases.forEach(updateMenuItem)
         let login = NSMenuItem(title: "Запускать при входе в систему", action: #selector(toggleLogin), keyEquivalent: "")
         loginItem = login
         let prefs = NSMenuItem(title: "Настройки…", action: #selector(openSettings), keyEquivalent: ",")
@@ -153,19 +150,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // MARK: hotkeys (the user can change them in Settings)
+
+    @discardableResult
+    private func register(_ kind: HotkeyKind) -> Bool {
+        let s = kind.shortcut
+        let id = HotKeys.shared.register(keyCode: s.keyCode, modifiers: s.carbon) { [weak self] in
+            switch kind {
+            case .area: self?.captureArea(via: "hotkey")
+            case .scroll: self?.captureScrolling(via: "hotkey")
+            }
+        }
+        hotkeyIDs[kind] = id
+        return id != nil
+    }
+
+    private func updateMenuItem(_ kind: HotkeyKind) {
+        guard let item = menuItems[kind] else { return }
+        let s = kind.shortcut
+        item.keyEquivalent = s.menuKey
+        item.keyEquivalentModifierMask = s.menuKey.isEmpty ? [] : s.cocoa
+    }
+
+    /// While a shortcut field is recording, the current hotkeys must not fire (pressing ⌘⇧9 there would start a capture).
+    func suspendHotkeys(_ suspend: Bool) {
+        if suspend {
+            hotkeyIDs.values.forEach { HotKeys.shared.unregister($0) }
+            hotkeyIDs = [:]
+        } else {
+            HotkeyKind.allCases.filter { hotkeyIDs[$0] == nil }.forEach { register($0) }
+        }
+    }
+
+    /// Switches a hotkey to a new combination. Returns nil on success, or why it could not.
+    func setShortcut(_ kind: HotkeyKind, _ s: Shortcut) -> String? {
+        let old = kind.shortcut
+        HotKeys.shared.unregister(hotkeyIDs[kind] ?? nil)
+        hotkeyIDs[kind] = nil
+        kind.shortcut = s
+        if !register(kind) {
+            kind.shortcut = old
+            register(kind)
+            return "\(s.display) уже занято другой программой"
+        }
+        updateMenuItem(kind)
+        SystemShortcuts.restoreUnused(inUse: HotkeyKind.allCases.map(\.shortcut))
+        Usage.count("settings.hotkey.\(kind.rawValue)")
+        Log.info("settings", "\(kind.rawValue) hotkey → \(s.display)")
+        return nil
+    }
+
     // MARK: capture flows
 
     @objc private func menuStopRecording() { stopRecording() }
 
     func captureArea(via: String = "hotkey") {
-        if recordHUD != nil { stopRecording(); return }   // ⌘⇧9 while recording (or starting to) stops it
+        if recordHUD != nil { stopRecording(); return }   // the area hotkey while recording (or starting to) stops it
         if scroller != nil { return }
         Usage.count("start.area.\(via)")
         startOverlay(mode: .capture, via: via)
     }
 
     func captureScrolling(via: String = "hotkey") {
-        if let s = scroller { s.stop(); return }   // second ⌘⇧8 stops scrolling
+        if let s = scroller { s.stop(); return }   // pressing the scroll hotkey again stops scrolling
         if recordHUD != nil { stopRecording(); return }
         Usage.count("start.scroll.\(via)")
         guard ensureAccessibility() else { return }

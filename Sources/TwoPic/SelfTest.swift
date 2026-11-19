@@ -443,6 +443,14 @@ enum UICheck {
               "the early-stop notice fits above the picture in the result editor")
         if let ui = snapshot(ed) { try SelfTest.write(ui, "\(outDir)/notice.png") }
 
+        // Shortcuts: names and the system-shortcut lookup (the result depends on this Mac's settings, so only logged).
+        check(Shortcut.defaultArea.display == "⇧⌘9" && Shortcut.defaultScroll.display == "⇧⌘8", "default shortcuts are ⇧⌘9 / ⇧⌘8")
+        check(!Shortcut(keyCode: kVK_ANSI_A, carbon: shiftKey).isUsable && Shortcut(keyCode: kVK_F5, carbon: 0).isUsable,
+              "a bare letter is refused, a bare F-key is allowed")
+        for s in [Shortcut(keyCode: kVK_ANSI_4, carbon: cmdKey | shiftKey), Shortcut(keyCode: kVK_ANSI_3, carbon: cmdKey | shiftKey | controlKey),
+                  Shortcut(keyCode: kVK_Space, carbon: cmdKey), Shortcut.defaultArea] {
+            SelfTest.log("  system shortcut for \(s.display): \(SystemShortcuts.conflict(with: s).map { "\($0.id) \($0.name)" } ?? "none")")
+        }
         // The settings window, laid out but not shown.
         let sw = SettingsController.shared.windowForTests()
         if let v = sw.contentView {
