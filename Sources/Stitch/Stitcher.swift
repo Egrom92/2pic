@@ -80,7 +80,8 @@ public struct StitchProbe: CustomStringConvertible {
 
     /// Most of the frame stayed in place: nothing really scrolled, something on the page just changed
     /// (a video, an animation). For a capture that means the end of the content.
-    public var mostlyStatic: Bool { height > 0 && staticTop + staticBottom >= height * 6 / 10 }
+    /// The same when all that changed is one narrow strip: a scrollbar fading out or bouncing.
+    public var mostlyStatic: Bool { height > 0 && (staticTop + staticBottom >= height * 6 / 10 || activeBands <= 1) }
 
     public var description: String {
         "\(reason); active bands \(activeBands)/\(FrameSignature.bands), static top \(staticTop) bottom \(staticBottom) of \(height), "
@@ -224,6 +225,50 @@ public enum StitchMatcher {
             return (StitchMatch(shift: bestShift, header: T, footer: F, score: bestRaw), pr)
         }
 
+        // Weaker, but unrivalled: no other offset comes anywhere near. That is how a messenger looks — bubbles
+        // scroll over a wallpaper that stays in place and never matches, and the app may scroll further than
+        // asked (Telegram: ×1.1), so before the first glued step the offset isn't near the expected one either.
+        // Neighbours within a text line don't count as rivals: rows can look alike there.
+        // Bands equal in the same place of both frames (the wallpaper showing through) say nothing about the offset.
+        var moved = mask
+        var movedPre = [Int](repeating: 0, count: h + 1)
+        for y in 0..<h {
+            var c = 0
+            let o = y * n
+            for k in 0..<n where moved[o + k] != 0 {
+                if a.hash[o + k] == b.hash[o + k] { moved[o + k] = 0 } else { c += 1 }
+            }
+            movedPre[y + 1] = movedPre[y] + c
+        }
+        var all: [(shift: Int, raw: Double, rank: Double)] = []
+        all.reserveCapacity(maxShift)
+        a.hash.withUnsafeBufferPointer { ah in
+        b.hash.withUnsafeBufferPointer { bh in
+        moved.withUnsafeBufferPointer { bm in
+            for s in 1...maxShift {
+                let y0 = T, y1 = h - F - s
+                guard y1 > y0 else { continue }
+                let total = movedPre[y1] - movedPre[y0]
+                if total < minTotal { continue }
+                var miss = 0
+                for y in y0..<y1 where movedPre[y + 1] != movedPre[y] {
+                    let bo = y * n, ao = (y + s) * n
+                    for k in 0..<n where bm[bo + k] != 0 && ah[ao + k] != bh[bo + k] { miss += 1 }
+                }
+                let raw = 1 - Double(miss) / Double(total)
+                all.append((s, raw, raw - 1.5 / Double(total).squareRoot()))
+            }
+        }}}
+        if let lead = all.max(by: { $0.rank < $1.rank }) {
+            let rival = all.filter { abs($0.shift - lead.shift) > 20 }.map(\.rank).max() ?? 0
+            if lead.raw >= 0.2 && lead.rank >= 3 * max(rival, 0.05) {
+                pr.bestShift = lead.shift
+                pr.bestScore = lead.raw
+                return (StitchMatch(shift: lead.shift, header: T, footer: F, score: lead.raw), pr)
+            }
+            pr.reason = String(format: "best %d %.2f (rank %.2f), rival rank %.2f", lead.shift, lead.raw, lead.rank, rival)
+        }
+
         // Last resort, for a big area that changes on its own (a video, a carousel): it matches at no
         // offset, but the rest of the page still matches at one offset far better than at its neighbours.
         // Accept that offset only where the scroll was expected to land.
@@ -253,7 +298,7 @@ public enum StitchMatcher {
             if near(top1.shift) && top1.raw >= 0.25 && top1.raw >= 2.5 * max(runnerUp, 0.04) {
                 return (StitchMatch(shift: top1.shift, header: T, footer: F, score: top1.raw), pr)
             }
-            pr.reason = String(format: "no distinct offset (best %.2f, runner-up %.2f)", top1.raw, runnerUp)
+            pr.reason = (pr.reason.isEmpty ? "" : pr.reason + "; ") + String(format: "no distinct offset (best %.2f, runner-up %.2f)", top1.raw, runnerUp)
         } else {
             pr.reason = best < 0 ? "no offset matched" : "best offset matched too weakly"
         }
