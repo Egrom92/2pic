@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/icon.png" width="150" alt="Логотип 2pic"></p>
+
 # 2pic
 
 Скриншоты и видео на Mac в один клик. Живёт в строке меню, без значка в Dock, без аккаунтов и рекламы. Бесплатно, macOS 14 Sonoma и новее.
