@@ -247,6 +247,107 @@ func runSidebar() -> Bool {
     return ok
 }
 
+/// A messenger: bubbles scroll over a patterned wallpaper that stays in place (Telegram, WhatsApp), and the app
+/// scrolls `ratio` times further than asked. `bubble`: share of the width a bubble takes, in percent — the less,
+/// the more of the frame is wallpaper that disagrees with the scroll.
+func runChat(name: String, ratio: Double, bubble: Int, seed: UInt64) -> Bool {
+    let width = 1480, viewH = 1472, pageH = 9000
+    var r = LCG(s: seed)
+    var wall = [UInt8](repeating: 255, count: width * viewH * 4)
+    for y in 0..<viewH { for x in 0..<width {   // blobs about 12 px big, like a doodle pattern
+        let cx: Int = x / 12, cy: Int = y / 12
+        // splitmix64 of the cell: no period (a plain LCG repeats every few dozen rows and matches itself)
+        var z = (UInt64(cx) << 32 | UInt64(cy)) &+ seed &* 0x9E3779B97F4A7C15
+        z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+        z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+        let kind = Int((z ^ (z >> 31)) % 5)
+        let v = UInt8(40 + kind * 9)
+        let o = (y * width + x) * 4
+        wall[o] = v; wall[o + 1] = v &+ 10; wall[o + 2] = v &+ 20
+    } }
+    // Bubbles: (top, height, left, width) in page coordinates, each with text lines.
+    var bubbles: [(Int, Int, Int, Int, UInt64)] = []
+    var y = 16
+    while y < pageH - 260 {
+        let h = 60 + Int(r.next() % 180)
+        let percent: Int = bubble * 2 / 3 + Int(r.next() % UInt64(max(1, bubble / 3)))
+        let w: Int = width * percent / 100
+        bubbles.append((y, h, r.next() % 3 == 0 ? width - w - 24 : 24, w, r.next()))
+        y += h + 10
+    }
+    let row = width * 4
+    func frame(_ off: Int) -> CGImage {
+        var px = wall
+        for b in bubbles where b.0 + b.1 > off && b.0 < off + viewH {
+            for py in max(b.0, off)..<min(b.0 + b.1, off + viewH) {
+                var t = LCG(s: b.4 &+ UInt64((py - b.0) / 26))
+                let line = (py - b.0) % 26, o = (py - off) * row
+                for x in b.2..<(b.2 + b.3) { for c in 0..<3 { px[o + x * 4 + c] = 52 } }
+                guard line >= 8, line < 22, (py - b.0) < b.1 - 12 else { continue }
+                var x = b.2 + 18
+                while x < b.2 + b.3 - 60 {
+                    let w = 8 + Int(t.next() % 40)
+                    for xx in x..<min(x + w, b.2 + b.3 - 16) { for c in 0..<3 { px[o + xx * 4 + c] = 235 } }
+                    x += w + 8
+                }
+            }
+        }
+        return image(px, width, viewH)
+    }
+    let st = Stitcher(maxHeight: 100_000)
+    var off = 0
+    _ = st.add(frame(0), requestedShift: 0)
+    var scores: [Double] = []
+    while true {
+        let body = st.bodyHeight ?? viewH
+        let req = body / 2, prev = off
+        off = min(off + Int((Double(req) * ratio).rounded()), pageH - viewH)
+        let step = st.add(frame(off), requestedShift: req)
+        if step == .noChange { break }
+        guard case .appended(let s) = step, s == off - prev else {
+            print("  \(name): FAILED (\(step)) at \(prev) → \(off) — \(st.lastProbe.map { "\($0)" } ?? "")"); return false
+        }
+        scores.append(st.lastRaw?.score ?? -1)
+    }
+    let ok = st.height == pageH
+    print("  \(name): \(ok ? "OK" : "height \(st.height), expected \(pageH)") — \(scores.count + 1) frames, "
+          + "scores \(scores.map { String(format: "%.2f", $0) }.joined(separator: " "))")
+    return ok
+}
+
+/// The end of the content while an overlay scrollbar fades: only that narrow strip changes. It is the end, not an error.
+func runScrollbarFade() -> Bool {
+    let page = makePage(width: 1200, height: 1400, seed: 12)
+    func frame(_ gray: CGFloat) -> CGImage {
+        let ctx = Stitcher.context(1200, 1400, page.colorSpace)!
+        ctx.draw(page, in: CGRect(x: 0, y: 0, width: 1200, height: 1400))
+        ctx.setFillColor(CGColor(gray: gray, alpha: 1))
+        ctx.fill(CGRect(x: 1186, y: 10, width: 8, height: 700))
+        return ctx.makeImage()!
+    }
+    let st = Stitcher(maxHeight: 100_000)
+    _ = st.add(frame(0.4), requestedShift: 0)
+    let r = st.add(frame(0.7), requestedShift: 700)
+    print("  fading scrollbar at the end: \(r == .noChange ? "OK" : "\(r) — \(st.lastProbe.map { "\($0)" } ?? "")")")
+    return r == .noChange
+}
+
+/// The page was replaced between the frames (a tab switched, an app jumped): nothing may be glued.
+func runUnrelated() -> Bool {
+    var wrong = 0, tried = 0
+    for seed in UInt64(100)..<140 {
+        let st = Stitcher(maxHeight: 100_000)
+        func frame(_ s: UInt64) -> CGImage {
+            makeFrame(page: makePage(width: 1200, height: 1500, seed: s), offset: 0, viewH: 1400, header: 120, footer: 60)
+        }
+        _ = st.add(frame(seed), requestedShift: 0)
+        tried += 1
+        if case .appended = st.add(frame(seed &+ 5000), requestedShift: 610) { wrong += 1 }
+    }
+    print("  unrelated frames: \(wrong == 0 ? "OK" : "GLUED \(wrong)") — \(tried) pairs")
+    return wrong == 0
+}
+
 var allOK = true
 allOK = runSidebar() && allOK
 allOK = run(name: "browser-like", pageH: 9000, viewH: 1400, header: 120, footer: 60, steps: [700], seed: 1) && allOK
@@ -262,5 +363,14 @@ allOK = runDynamic(name: "video at the end", pageH: 5000, viewH: 1400, header: 1
                    lazy: false, video: 4500..<4780) && allOK
 allOK = runDynamic(name: "video + uneven scrolling", pageH: 7000, viewH: 1400, header: 120, footer: 60, step: 610,
                    seed: 8, lazy: false, video: 2600..<2880, actual: [610, 520, 640, 610, 470], mayStop: true) && allOK
+// Messengers: a fixed wallpaper under the scrolling bubbles, and a scroll longer than asked.
+for seed in UInt64(20)...23 {
+    allOK = runChat(name: "chat, wide bubbles, ×1.1 #\(seed)", ratio: 1.1, bubble: 85, seed: seed) && allOK
+    allOK = runChat(name: "chat, narrow bubbles, ×1.1 #\(seed)", ratio: 1.1, bubble: 60, seed: seed) && allOK
+}
+allOK = runChat(name: "chat, ×0.8", ratio: 0.8, bubble: 75, seed: 30) && allOK
+allOK = runChat(name: "chat, ×1.0", ratio: 1.0, bubble: 60, seed: 31) && allOK
+allOK = runScrollbarFade() && allOK
+allOK = runUnrelated() && allOK
 print(allOK ? "ALL OK" : "SOME FAILED")
 exit(allOK ? 0 : 1)
