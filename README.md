@@ -95,6 +95,15 @@ curl -fsSL https://raw.githubusercontent.com/Egrom92/2pic/main/uninstall.sh | ba
 - Проверки: склейка прокрутки — `swift run -c release StitchCheck`; редактор без экрана — `swift build && .build/debug/TwoPic --selftest ui <папка>`.
 - Отправка ошибок и статистики на свой сервер с уведомлениями в Telegram — см. [server/README.md](server/README.md). Поля для адреса и ключа появляются в «Настройках…», если открыть их с зажатым ⌥ Option.
 
+## Другие программы
+
+- [Oops](https://eglibyte.ee/ru/oops.html) — исправляет текст, набранный не в той раскладке
+- [Peekaboo](https://eglibyte.ee/ru/peekaboo.html) — прячет лишние значки в строке меню
+- [Magpie](https://eglibyte.ee/ru/magpie.html) — помнит всё, что вы копировали
+- [Lark](https://eglibyte.ee/ru/lark.html) — звук, микрофон и пауза для всего, что играет
+
+Все программы: [eglibyte.ee/ru/tools.html](https://eglibyte.ee/ru/tools.html)
+
 ## Лицензия
 
 MIT — см. [LICENSE](LICENSE).
