@@ -15,7 +15,7 @@ struct RecordingResult {
     var error: Error?
 }
 
-/// Records one screen region to an H.264 .mp4 (ScreenCaptureKit → AVAssetWriter), with the cursor.
+/// Records one screen region to an .mp4 (HEVC when Settings.compact, else H.264) (ScreenCaptureKit → AVAssetWriter), with the cursor.
 /// The capture/writer state is touched only on `queue`, so the class is safe to hand between threads.
 final class RegionRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     let url: URL
@@ -38,8 +38,11 @@ final class RegionRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
          onInterrupt: @escaping @Sendable (Error) -> Void) async throws {
         self.url = url
         self.onInterrupt = onInterrupt
-        let scale = screen.backingScaleFactor
-        // H.264 wants even pixel sizes.
+        // Compact: 1 pixel per point (Retina 2× → 1×), 30 fps, HEVC — several times smaller, text still readable.
+        let compact = Settings.compact
+        let scale = compact ? 1 : screen.backingScaleFactor
+        let fps: Int32 = compact ? 30 : 60
+        // The encoders want even pixel sizes.
         let wPx = max(2, Int(rect.width * scale) / 2 * 2), hPx = max(2, Int(rect.height * scale) / 2 * 2)
         let src = CGRect(x: rect.minX, y: rect.minY, width: CGFloat(wPx) / scale, height: CGFloat(hPx) / scale)
 
@@ -53,22 +56,25 @@ final class RegionRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         cfg.height = hPx
         cfg.showsCursor = true
         cfg.captureResolution = .best
-        cfg.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+        cfg.minimumFrameInterval = CMTime(value: 1, timescale: fps)
         cfg.pixelFormat = kCVPixelFormatType_32BGRA
         cfg.colorSpaceName = CGColorSpace.sRGB
         cfg.queueDepth = 6
 
         writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
-        let bitrate = min(40_000_000, max(4_000_000, wPx * hPx * 5))
+        let bitrate = compact ? min(4_000_000, max(500_000, wPx * hPx))
+                              : min(40_000_000, max(4_000_000, wPx * hPx * 5))
+        var compression: [String: Any] = [
+            AVVideoAverageBitRateKey: bitrate,
+            AVVideoExpectedSourceFrameRateKey: fps,
+            AVVideoMaxKeyFrameIntervalDurationKey: 5,
+        ]
+        if !compact { compression[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel }
         input = AVAssetWriterInput(mediaType: .video, outputSettings: [
-            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoCodecKey: compact ? AVVideoCodecType.hevc : AVVideoCodecType.h264,
             AVVideoWidthKey: wPx,
             AVVideoHeightKey: hPx,
-            AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: bitrate,
-                AVVideoExpectedSourceFrameRateKey: 60,
-                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
-            ],
+            AVVideoCompressionPropertiesKey: compression,
             AVVideoColorPropertiesKey: [
                 AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
                 AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,

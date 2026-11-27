@@ -37,6 +37,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let taken = HotkeyKind.allCases.compactMap { register($0) ? nil : $0.shortcut.display }
         enableLoginItemOnce()
         observeSystem()
+        Cleanup.start()
         if !CGPreflightScreenCaptureAccess() {
             Log.warn("permission", "no screen recording permission yet: asking")
             CGRequestScreenCaptureAccess()

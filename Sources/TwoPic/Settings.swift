@@ -17,18 +17,28 @@ enum Settings {
             ?? FileManager.default.homeDirectoryForCurrentUser
     }
 
-    /// Where screenshots (⌘S) and videos go. Falls back to the Desktop if the chosen folder is gone
-    /// (an unplugged drive, a deleted folder).
+    /// 2pic's own folder: ~/Pictures/2pic ("Изображения/2pic"). Made when first needed.
+    static var defaultFolder: URL {
+        (FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Pictures"))
+            .appendingPathComponent("2pic", isDirectory: true)
+    }
+
+    /// Where screenshots (⌘S) and videos go: the default folder unless another one was chosen. Falls back to the
+    /// default folder if the chosen one is gone (an unplugged drive, a deleted folder), and to the Desktop if even
+    /// that can't be made.
     static var saveFolder: URL {
         get {
             var isDir: ObjCBool = false
             if let p = d.string(forKey: "saveFolder"), FileManager.default.fileExists(atPath: p, isDirectory: &isDir), isDir.boolValue {
                 return URL(fileURLWithPath: p, isDirectory: true)
             }
+            let def = defaultFolder
+            if (try? FileManager.default.createDirectory(at: def, withIntermediateDirectories: true)) != nil { return def }
             return desktop
         }
         set {
-            if newValue.standardizedFileURL.path == desktop.standardizedFileURL.path {
+            if newValue.standardizedFileURL.path == defaultFolder.standardizedFileURL.path {
                 d.removeObject(forKey: "saveFolder")
             } else {
                 d.set(newValue.path, forKey: "saveFolder")
@@ -42,6 +52,20 @@ enum Settings {
     static var imageFormat: ImageFormat {
         get { ImageFormat(rawValue: d.string(forKey: "imageFormat") ?? "") ?? .png }
         set { d.set(newValue.rawValue, forKey: "imageFormat") }
+    }
+
+    /// Files 2pic made go to the Trash after this many days; 0 = never. 7 by default.
+    static var cleanupDays: Int {
+        get { max(0, (d.object(forKey: "cleanupDays") as? Int) ?? 7) }
+        set { d.set(newValue, forKey: "cleanupDays") }
+    }
+    static let cleanupChoices = [0, 1, 3, 7, 14, 30]
+
+    /// Smallest files that still read well: pictures and video at 1 point = 1 pixel (no Retina doubling),
+    /// stronger JPEG, video in HEVC at 30 fps. On by default.
+    static var compact: Bool {
+        get { (d.object(forKey: "compact") as? Bool) ?? true }
+        set { d.set(newValue, forKey: "compact") }
     }
 
     static var areaShortcut: Shortcut {
@@ -105,8 +129,11 @@ final class SettingsController: NSObject {
     private var window: SettingsWindow?
     private let folderIcon = NSImageView()
     private let folderLabel = NSTextField(labelWithString: "")
-    private let resetButton = NSButton(title: "Рабочий стол", target: nil, action: nil)
+    private let resetButton = NSButton(title: "По умолчанию", target: nil, action: nil)
+    private let renameButton = NSButton(title: "Переименовать…", target: nil, action: nil)
+    private let cleanup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let format = NSSegmentedControl(labels: ["PNG", "JPEG"], trackingMode: .selectOne, target: nil, action: nil)
+    private let compactBox = NSButton(checkboxWithTitle: "Сжимать до минимума", target: nil, action: nil)
     private let sendBox = NSButton(checkboxWithTitle: "Отправлять ошибки и статистику на свой сервер", target: nil, action: nil)
     private let urlField = NSTextField(string: "")
     private let tokenField = NSSecureTextField(string: "")
@@ -122,7 +149,7 @@ final class SettingsController: NSObject {
     /// The server rows are for whoever runs their own 2pic server; others never see them.
     /// Shown when a server is already set, or when Settings is opened with ⌥ held.
     private var showServer = false
-    private static let serverRows = 8...13
+    private static let serverRows = 9...14
 
     var isShown: Bool { window?.isVisible == true }
 
@@ -155,18 +182,34 @@ final class SettingsController: NSObject {
         folderIcon.heightAnchor.constraint(equalToConstant: 16).isActive = true
         folderLabel.lineBreakMode = .byTruncatingMiddle
         folderLabel.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .medium)
-        let folderRow = NSStackView(views: [folderIcon, folderLabel])
+        let reveal = NSButton(image: NSImage(systemSymbolName: "arrow.right.circle.fill", accessibilityDescription: "Показать в Finder")!,
+                              target: self, action: #selector(revealFolder))
+        reveal.isBordered = false
+        reveal.toolTip = "Показать в Finder"
+        let folderRow = NSStackView(views: [folderIcon, folderLabel, reveal])
         folderRow.spacing = 6
 
-        let choose = NSButton(title: "Выбрать папку…", target: self, action: #selector(chooseFolder))
+        let choose = NSButton(title: "Другая папка…", target: self, action: #selector(chooseFolder))
+        choose.toolTip = "Сохранять в другую папку (файлы 2pic можно перенести туда же)"
+        renameButton.target = self
+        renameButton.action = #selector(renameFolder)
         resetButton.target = self
         resetButton.action = #selector(resetFolder)
-        resetButton.toolTip = "Снова сохранять на рабочий стол"
-        let buttons = NSStackView(views: [choose, resetButton])
+        resetButton.toolTip = "Снова сохранять в «Изображения/2pic»"
+        let buttons = NSStackView(views: [choose, renameButton, resetButton])
         buttons.spacing = 8
+
+        for days in Settings.cleanupChoices {
+            cleanup.addItem(withTitle: Self.cleanupTitle(days))
+            cleanup.lastItem?.tag = days
+        }
+        cleanup.target = self
+        cleanup.action = #selector(cleanupChanged)
 
         format.target = self
         format.action = #selector(formatChanged)
+        compactBox.target = self
+        compactBox.action = #selector(compactChanged)
 
         func hint(_ s: String) -> NSTextField {
             let h = NSTextField(wrappingLabelWithString: s)
@@ -208,16 +251,19 @@ final class SettingsController: NSObject {
             MainActor.assumeIsolated { self?.shortcutFields.values.forEach { $0.stop() } }
         }
 
+        let formatRow = NSStackView(views: [format, compactBox])
+        formatRow.spacing = 12
         let grid = NSGridView(views: [
             [label("Снимок области:"), shortcutRow(.area)],
             [label("С прокруткой:"), shortcutRow(.scroll)],
             [NSGridCell.emptyContentView, hotkeyStatus],
             [label("Сохранять в:"), folderRow],
             [NSGridCell.emptyContentView, buttons],
-            [NSGridCell.emptyContentView, hint("Сюда сохраняются снимки (⌘S) и видео.")],
-            [label("Формат снимков:"), format],
+            [label("В Корзину:"), cleanup],
+            [NSGridCell.emptyContentView, hint("Сюда сохраняются снимки (⌘S) и видео. Старые файлы 2pic уходят в Корзину сами — из неё их можно вернуть. Другие файлы в папке 2pic не трогает.")],
+            [label("Формат снимков:"), formatRow],
             [NSGridCell.emptyContentView,
-             hint("JPEG — файлы меньше, но с небольшой потерей качества. В буфер обмена снимок всегда копируется в PNG.")],
+             hint("JPEG — файлы меньше, но с небольшой потерей качества. В буфер обмена снимок всегда копируется в PNG. «Сжимать до минимума»: снимки и видео без Retina-удвоения (текст читается, файл в разы легче), видео — HEVC, 30 кадров/с.")],
             [label("Сервер:"), sendBox],
             [label("Адрес:"), urlField],
             [label("Ключ:"), tokenField],
@@ -232,8 +278,8 @@ final class SettingsController: NSObject {
         grid.rowSpacing = 8
         grid.columnSpacing = 10
         grid.row(at: 2).bottomPadding = 10   // a gap after the shortcuts
-        grid.row(at: 5).bottomPadding = 10   // a gap between the folder and the format groups
-        grid.row(at: 7).bottomPadding = 10   // … and before the server group
+        grid.row(at: 6).bottomPadding = 10   // a gap between the folder and the format groups
+        grid.row(at: 8).bottomPadding = 10   // … and before the server group
         grid.translatesAutoresizingMaskIntoConstraints = false
         self.grid = grid
 
@@ -258,17 +304,26 @@ final class SettingsController: NSObject {
     private func update() {
         let url = Settings.saveFolder
         folderIcon.image = NSWorkspace.shared.icon(forFile: url.path)
-        folderLabel.stringValue = Settings.saveFolderName
+        folderLabel.stringValue = FileManager.default.displayName(atPath: url.deletingLastPathComponent().path)
+            + " › " + Settings.saveFolderName
         folderLabel.toolTip = url.path
-        resetButton.isHidden = url.standardizedFileURL.path == Settings.desktop.standardizedFileURL.path
+        resetButton.isHidden = url.standardizedFileURL.path == Settings.defaultFolder.standardizedFileURL.path
+        renameButton.isEnabled = Self.canRename(url)
+        cleanup.selectItem(withTag: Settings.cleanupDays)
+        if cleanup.selectedItem == nil {   // a value set by hand: show it too
+            cleanup.addItem(withTitle: Self.cleanupTitle(Settings.cleanupDays))
+            cleanup.lastItem?.tag = Settings.cleanupDays
+            cleanup.selectItem(withTag: Settings.cleanupDays)
+        }
         format.selectedSegment = Settings.imageFormat == .png ? 0 : 1
+        compactBox.state = Settings.compact ? .on : .off
         sendBox.state = Telemetry.enabled ? .on : .off
         urlField.stringValue = Telemetry.endpoint
         tokenField.stringValue = Telemetry.token
         for (kind, f) in shortcutFields { f.shortcut = kind.shortcut }
         if let grid {
             for i in Self.serverRows { grid.row(at: i).isHidden = !showServer }
-            grid.row(at: 7).bottomPadding = showServer ? 10 : 0
+            grid.row(at: 8).bottomPadding = showServer ? 10 : 0
         }
     }
 
@@ -376,24 +431,137 @@ final class SettingsController: NSObject {
         p.beginSheetModal(for: window) { response in
             MainActor.assumeIsolated {
                 guard response == .OK, let url = p.url else { return }
-                Settings.saveFolder = url
-                Usage.count("settings.folder")
-                Log.info("settings", "save folder → «\(Settings.saveFolderName)»")
-                self.update()
+                self.switchFolder(to: url)
             }
         }
     }
 
     @objc private func resetFolder() {
-        Settings.saveFolder = Settings.desktop
+        let def = Settings.defaultFolder
+        try? FileManager.default.createDirectory(at: def, withIntermediateDirectories: true)
+        switchFolder(to: def)
+    }
+
+    /// Saves to `url` from now on; if the old folder has 2pic files, offers to move them along.
+    private func switchFolder(to url: URL) {
+        let old = Settings.saveFolder
+        Settings.saveFolder = url
         Usage.count("settings.folder")
-        Log.info("settings", "save folder → Desktop")
+        Log.info("settings", "save folder → «\(Settings.saveFolderName)»")
         update()
+        guard old.standardizedFileURL.path != url.standardizedFileURL.path, let window else { return }
+        let files = Cleanup.ourFiles(in: old)
+        guard !files.isEmpty else { Cleanup.run(); return }
+        let a = NSAlert()
+        a.messageText = "Перенести снимки и видео 2pic в новую папку?"
+        a.informativeText = "В «\(FileManager.default.displayName(atPath: old.path))» их \(files.count). Другие файлы останутся на месте."
+        a.addButton(withTitle: "Перенести")
+        a.addButton(withTitle: "Оставить")
+        a.beginSheetModal(for: window) { r in
+            MainActor.assumeIsolated {
+                if r == .alertFirstButtonReturn {
+                    var moved = 0
+                    for f in files {
+                        let dst = url.appendingPathComponent(f.lastPathComponent)
+                        if FileManager.default.fileExists(atPath: dst.path) { continue }
+                        if (try? FileManager.default.moveItem(at: f, to: dst)) != nil { moved += 1 }
+                    }
+                    Log.info("settings", "moved \(moved) of \(files.count) file(s) to the new folder")
+                    if moved < files.count {
+                        self.showAlert("Перенесено \(moved) из \(files.count)",
+                                       "Остальные остались в старой папке: там нет доступа или в новой уже есть файл с таким именем.")
+                    }
+                }
+                Cleanup.run()
+            }
+        }
+    }
+
+    /// The Desktop, home and other system folders can't be renamed from here; folders the user made can.
+    private static func canRename(_ url: URL) -> Bool {
+        let fm = FileManager.default
+        let p = url.standardizedFileURL.path
+        let home = fm.homeDirectoryForCurrentUser.standardizedFileURL.path
+        guard p.hasPrefix(home + "/"), fm.isWritableFile(atPath: url.deletingLastPathComponent().path) else { return false }
+        let system: [FileManager.SearchPathDirectory] = [.desktopDirectory, .documentDirectory, .downloadsDirectory,
+                                                         .picturesDirectory, .moviesDirectory, .musicDirectory]
+        return !system.compactMap { fm.urls(for: $0, in: .userDomainMask).first?.standardizedFileURL.path }.contains(p)
+    }
+
+    @objc private func renameFolder() {
+        guard let window else { return }
+        let old = Settings.saveFolder
+        let a = NSAlert()
+        a.messageText = "Новое имя папки"
+        a.informativeText = "Папка останется на том же месте, 2pic продолжит сохранять в неё."
+        let field = NSTextField(string: old.lastPathComponent)
+        field.frame = NSRect(x: 0, y: 0, width: 260, height: 24)
+        a.accessoryView = field
+        a.addButton(withTitle: "Переименовать")
+        a.addButton(withTitle: "Отмена")
+        a.window.initialFirstResponder = field
+        a.beginSheetModal(for: window) { r in
+            MainActor.assumeIsolated {
+                guard r == .alertFirstButtonReturn else { return }
+                let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !name.isEmpty, name != old.lastPathComponent else { return }
+                guard !name.contains("/"), !name.contains(":"), !name.hasPrefix(".") else {
+                    self.showAlert("Такое имя не подойдёт", "В имени папки не должно быть «/» и «:», и оно не может начинаться с точки.")
+                    return
+                }
+                let dst = old.deletingLastPathComponent().appendingPathComponent(name, isDirectory: true)
+                do {
+                    try FileManager.default.moveItem(at: old, to: dst)
+                    Settings.saveFolder = dst
+                    Usage.count("settings.folder.rename")
+                    Log.info("settings", "save folder renamed → «\(name)»")
+                    self.update()
+                } catch {
+                    Log.warn("settings", "rename failed: \(error)")
+                    self.showAlert("Не удалось переименовать",
+                                   FileManager.default.fileExists(atPath: dst.path) ? "Папка «\(name)» там уже есть." : error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    @objc private func revealFolder() {
+        NSWorkspace.shared.activateFileViewerSelecting([Settings.saveFolder])
+    }
+
+    private func showAlert(_ title: String, _ text: String) {
+        guard let window else { return }
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = text
+        a.beginSheetModal(for: window)
+    }
+
+    private static func cleanupTitle(_ days: Int) -> String {
+        switch days {
+        case 0: return "Не убирать"
+        case 1: return "Через 1 день"
+        case 2...4: return "Через \(days) дня"
+        default: return "Через \(days) дней"
+        }
+    }
+
+    @objc private func cleanupChanged() {
+        Settings.cleanupDays = cleanup.selectedItem?.tag ?? 7
+        Usage.count("settings.cleanup.\(Settings.cleanupDays)")
+        Log.info("settings", "cleanup → \(Settings.cleanupDays) d")
+        Cleanup.run()
     }
 
     @objc private func formatChanged() {
         Settings.imageFormat = format.selectedSegment == 1 ? .jpeg : .png
         Usage.count("settings.format.\(Settings.imageFormat.rawValue)")
         Log.info("settings", "image format → \(Settings.imageFormat.rawValue)")
+    }
+
+    @objc private func compactChanged() {
+        Settings.compact = compactBox.state == .on
+        Usage.count("settings.compact.\(Settings.compact ? "on" : "off")")
+        Log.info("settings", "compact → \(Settings.compact)")
     }
 }
