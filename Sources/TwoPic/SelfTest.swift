@@ -17,6 +17,7 @@ import ServiceManagement
 ///   e2e-area X1 Y1 X2 Y2 OUT       press ⌘⇧9 in the running 2pic, drag, ⌘C, save the clipboard to OUT
 ///   e2e-window X Y OUT             press ⌘⇧9, click a window, ⌘C, save the clipboard to OUT
 ///   e2e-scroll X1 Y1 X2 Y2 OUT     press ⌘⇧8, drag, wait for the result, ⌘C, save the clipboard to OUT
+///   cleanup DIR DAYS               move 2pic files older than DAYS in DIR to the Trash
 enum SelfTest {
     static func log(_ s: String) { FileHandle.standardError.write((s + "\n").data(using: .utf8)!) }
 
@@ -193,6 +194,9 @@ enum SelfTest {
             try await saveClipboard(after: before, to: a[0])
         case "ui":   // ui OUTDIR — offscreen checks of the editor: synthetic screen, synthetic clicks, no real input
             try await UICheck.run(outDir: a[0])
+        case "cleanup":   // cleanup DIR DAYS — move 2pic files older than DAYS in DIR to the Trash, print the count
+            let n = Cleanup.trashOld(in: URL(fileURLWithPath: a[0]), olderThan: (Double(a[1]) ?? 7) * 86_400)
+            log("cleanup: \(n) file(s) to the Trash")
         case "diag":   // diag OUTDIR — log rotation, usage counters and report, crash detection
             try await DiagCheck.run(outDir: a[0])
         case "telemetry":   // telemetry BASEURL KEY — sending to a running server (server/test_server.py --app runs it)

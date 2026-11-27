@@ -235,10 +235,25 @@ enum Output {
         return CGImageDestinationFinalize(dest) ? data as Data : nil
     }
 
+    /// With Settings.compact: the picture brought down to 1 pixel per point (Retina 2× → 1×), the cheapest size
+    /// at which text still reads as on a regular display. Otherwise (or on a 1× screen) unchanged.
+    static func compacted(_ img: CGImage, pxPerPt: CGFloat) -> (image: CGImage, pxPerPt: CGFloat) {
+        guard Settings.compact, pxPerPt > 1.01 else { return (img, pxPerPt) }
+        let w = max(1, Int((CGFloat(img.width) / pxPerPt).rounded())), h = max(1, Int((CGFloat(img.height) / pxPerPt).rounded()))
+        let cs = img.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: cs,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return (img, pxPerPt) }
+        ctx.interpolationQuality = .high
+        ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+        guard let out = ctx.makeImage() else { return (img, pxPerPt) }
+        return (out, 1)
+    }
+
     private static var tiffProvider: TIFFProvider?
 
     /// PNG goes on the clipboard right away; TIFF (for old apps) is produced only if someone asks.
     static func copy(_ img: CGImage, pxPerPt: CGFloat) {
+        let (img, pxPerPt) = compacted(img, pxPerPt: pxPerPt)
         guard let png = encode(img, type: .png, dpi: 72 * pxPerPt) else { return }
         let pb = NSPasteboard.general
         pb.clearContents()
@@ -273,7 +288,9 @@ enum Output {
     @discardableResult
     static func save(_ img: CGImage, pxPerPt: CGFloat) throws -> URL {
         let fmt = Settings.imageFormat
-        guard let data = encode(img, type: fmt.type, dpi: 72 * pxPerPt, quality: fmt == .jpeg ? 0.9 : nil) else {
+        let (img, pxPerPt) = compacted(img, pxPerPt: pxPerPt)
+        let quality = Settings.compact ? 0.7 : 0.9
+        guard let data = encode(img, type: fmt.type, dpi: 72 * pxPerPt, quality: fmt == .jpeg ? quality : nil) else {
             throw SaveError.encode
         }
         let url = newFileURL(ext: fmt.ext)
